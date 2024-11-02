@@ -5,7 +5,7 @@ A CUDA based modular neural network library
 
 Likely my final Neural Network repository, I've been working on this neural netork projects for a couple months now. But I've limited by the fact I had a AMD card, so I was stuck to slow CPU based training. 
 
-Now that I have a much faster Nividia card I've modified my previous NumPy and SciPy based [library](https://github.com/TheonlyIcebear/Neural-Net-Framework) to work with tensorflow and cupy. And it's over 100x faster
+Now that I have a much faster Nividia card I've modified my previous NumPy and SciPy based [library](https://github.com/TheonlyIcebear/Neural-Net-Framework) to work with tensorflow and cupy. And it's over 300x faster
 
 
 # Object Detection 🤖
