@@ -15,6 +15,9 @@ Heres a couple showcases:
  - https://www.youtube.com/watch?v=uV8g4THpF6g
  - https://www.youtube.com/watch?v=15d-3FqNH-g
 
+![image](https://github.com/user-attachments/assets/7efdd2a7-1c00-428b-b568-7378fd7805bc)
+
+
 # Updates 📰
 
 My previous model was purely sequential, meaning the output from the previous layer would only go straight into the next layer. I've now added both a `ResidualBlock` and a `ConcatBlock` layer which can skip connections. This is very important for feature pyramid architectures.
