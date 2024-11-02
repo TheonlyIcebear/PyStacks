@@ -15,7 +15,8 @@ Heres a couple showcases:
  - https://www.youtube.com/watch?v=uV8g4THpF6g
  - https://www.youtube.com/watch?v=15d-3FqNH-g
 
-![image](https://github.com/user-attachments/assets/7efdd2a7-1c00-428b-b568-7378fd7805bc)
+![image](https://github.com/user-attachments/assets/d25b6fce-3fa3-411c-ae61-3271faccbb7a)
+
 
 
 # Updates 📰
