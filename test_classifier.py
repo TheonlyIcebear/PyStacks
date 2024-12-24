@@ -51,7 +51,7 @@ class Main:
 
                 print(input_data.shape)
 
-                output = self.network.forward(input_data[None, ...], training=False)
+                output = self.network.forward(input_data[None, ...], training=False)[0][0]
 
                 answer = int(np.argmax(output))
                 print(f"It's a {options[answer]}")
