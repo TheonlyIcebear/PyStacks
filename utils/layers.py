@@ -14,7 +14,7 @@ class Layer:
     def size(self):
         return 0
 
-    def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
+    def initialize(self, input_shape, initialize_weights=True, dtype=cp.float64):
         self.output_shape = input_shape
         self.dtype = dtype
 
@@ -24,13 +24,13 @@ class Layer:
     def backward(self, input_activations, node_values):
         return node_values, []
 
-    def update(self, optimizer, gradient, descent_values, learning_rate):
+    def update(self, optimizer, gradient, descent_values, learning_rate, iteration):
         pass
 
     def save(self):
         return [], None
 
-    def load(self, data):
+    def load(self, data, dtype):
         pass
 
 
@@ -100,17 +100,17 @@ class Conv2d(Layer):
             padding = self.padding,
         )
 
-        kernels_gradient = tf.cast(kernels_gradient, node_values.dtype)
-        new_node_values = tf.cast(new_node_values, node_values.dtype)
+        # kernels_gradient = tf.cast(kernels_gradient, node_values.dtype)
+        # new_node_values = tf.cast(new_node_values, node_values.dtype)
 
-        kernels_biases_gradient = node_values
+        biases_gradient = tf.reduce_mean(node_values, axis=0)
 
         return new_node_values, [
             cp.array(kernels_gradient), 
-            cp.array(kernels_biases_gradient)
+            cp.array(biases_gradient)
         ]
 
-    def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
+    def initialize(self, input_shape, initialize_weights=True, dtype=cp.float64):
         input_channels = int(input_shape[-1])
         output_channels = self.depth
 
@@ -131,7 +131,10 @@ class Conv2d(Layer):
         self.output_shape = output_shape
 
         if initialize_weights:
-            if (not self.variance) or self.variance == "He":
+            if isinstance(self.variance, str):
+                self.variance = self.variance.lower()
+                
+            if (not self.variance) or self.variance == "he":
                 variance = cp.sqrt(2 / (fan_in))
                 self.kernels = cp.random.normal(0, variance, (kernel_height, kernel_width, input_channels, output_channels))
 
@@ -150,7 +153,7 @@ class Conv2d(Layer):
             self.biases = cp.zeros(output_shape).astype(dtype)
             self.kernels = self.kernels.astype(dtype)
 
-    def update(self, optimizer, gradient, descent_values, learning_rate):
+    def update(self, optimizer, gradient, descent_values, learning_rate, iteration):
         if not descent_values is None:
             kernel_descent_values, bias_descent_values = descent_values
 
@@ -158,20 +161,20 @@ class Conv2d(Layer):
             kernel_descent_values = None
             bias_descent_values = None
 
-        kernels_gradient, kernels_biases_gradient = gradient
+        kernels_gradient, biases_gradient = gradient
 
-        self.kernels, new_kernel_descent_values = optimizer.apply_gradient(self.kernels, kernels_gradient, kernel_descent_values, learning_rate)
-        self.biases, new_bias_descent_values = optimizer.apply_gradient(self.biases, kernels_biases_gradient, bias_descent_values, learning_rate)
+        self.kernels, new_kernel_descent_values = optimizer.apply_gradient(self.kernels, kernels_gradient, kernel_descent_values, learning_rate, iteration)
+        self.biases, new_bias_descent_values = optimizer.apply_gradient(self.biases, biases_gradient, bias_descent_values, learning_rate, iteration)
 
         return [new_kernel_descent_values, new_bias_descent_values]
 
     def save(self):
         return [self.depth, self.kernel_shape, self.stride, self.variance, self.padding], [self.kernels.get(), self.biases.get()]
 
-    def load(self, data):
+    def load(self, data, dtype):
         self.kernels, self.biases = data
-        self.kernels = cp.array(self.kernels)
-        self.biases = cp.array(self.biases)
+        self.kernels = cp.array(self.kernels, dtype=dtype)
+        self.biases = cp.array(self.biases, dtype=dtype)
 
 class MaxPool(Layer):
     def __init__(self, pooling_shape = [2, 2], pooling_stride = None, padding="SAME"):
@@ -218,7 +221,7 @@ class MaxPool(Layer):
         
         return new_node_values, []
 
-    def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
+    def initialize(self, input_shape, initialize_weights=True, dtype=cp.float64):
         output_shape = input_shape
 
         if self.padding.upper() == "SAME":
@@ -299,25 +302,25 @@ class ConcatBlock(Layer):
 
         return _node_values + residual_node_values, [gradients, residual_gradients]
 
-    def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
+    def initialize(self, input_shape, initialize_weights=True, dtype=cp.float64):
         output_shape = input_shape.copy()
-
+        
         for layer in self.layers:
-            layer.initialize(output_shape, dtype=dtype)
+            layer.initialize(output_shape, initialize_weights=initialize_weights, dtype=dtype)
             output_shape = layer.output_shape
             print(output_shape, "MAIN")
 
         residual_output_shape = input_shape.copy()
 
         for layer in self.residual_layers:
-            layer.initialize(residual_output_shape, dtype=dtype)
+            layer.initialize(residual_output_shape, initialize_weights=initialize_weights, dtype=dtype)
             residual_output_shape = layer.output_shape
             print(residual_output_shape, "RES")
 
         self.output_shape = output_shape
         self.output_shape[-1] += residual_output_shape[-1]
 
-    def update(self, optimizer, gradient, descent_values, learning_rate):
+    def update(self, optimizer, gradient, descent_values, learning_rate, iteration):
         gradients, residual_gradients = gradient
 
         if descent_values:
@@ -330,13 +333,13 @@ class ConcatBlock(Layer):
         new_descent_values = []
 
         for layer, layer_gradient, descent_value in zip(self.layers, gradients, descent_values):
-            new_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate)
+            new_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate, iteration)
             new_descent_values.append(new_descent_value)
 
         new_residual_descent_values = []
 
         for layer, layer_gradient, descent_value in zip(self.residual_layers, residual_gradients, residual_descent_values):
-            new_residual_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate)
+            new_residual_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate, iteration)
             new_residual_descent_values.append(new_residual_descent_value)
 
         return [new_descent_values, new_residual_descent_values]
@@ -353,19 +356,19 @@ class ConcatBlock(Layer):
 
         return [None, None], [layers_data, residual_layers_data]
 
-    def load(self, data):
+    def load(self, data, dtype):
         layers_data, residual_layers_data = data
         layers = []
         residual_layers = []
 
         for layer_args, layer_data, layer_class in layers_data:
             layer = layer_class(*layer_args)
-            layer.load(layer_data)
+            layer.load(layer_data, dtype=dtype)
             layers.append(layer)
 
         for layer_args, layer_data, layer_class in residual_layers_data:
             layer = layer_class(*layer_args)
-            layer.load(layer_data)
+            layer.load(layer_data, dtype=dtype)
             residual_layers.append(layer)
 
         self.layers = layers
@@ -418,23 +421,23 @@ class ResidualBlock(Layer):
 
         return _node_values + node_values, [gradients]
 
-    def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
+    def initialize(self, input_shape, initialize_weights=True, dtype=cp.float64):
         output_shape = input_shape.copy()
 
         for layer in self.layers:
-            layer.initialize(output_shape, dtype=dtype)
+            layer.initialize(output_shape, initialize_weights=initialize_weights, dtype=dtype)
             output_shape = layer.output_shape
             print(output_shape, "MAIN")
 
         self.output_shape = output_shape
 
-    def update(self, optimizer, gradients, descent_values, learning_rate):
+    def update(self, optimizer, gradients, descent_values, learning_rate, iteration):
         new_descent_values = []
         if descent_values is None:
             descent_values = []
 
         for layer, layer_gradient, descent_value in zip(self.layers, gradients, descent_values):
-            new_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate)
+            new_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate, iteration)
             new_descent_values.append(new_descent_value)
 
         return new_descent_values
@@ -447,7 +450,7 @@ class ResidualBlock(Layer):
 
         return [None], layers_data
 
-    def load(self, data):
+    def load(self, data, dtype):
         layers = []
 
         if len(data) == 1:
@@ -455,7 +458,7 @@ class ResidualBlock(Layer):
 
         for layer_args, layer_data, layer_class in data:
             layer = layer_class(*layer_args)
-            layer.load(layer_data)
+            layer.load(layer_data, dtype=dtype)
             layers.append(layer)
 
         self.layers = layers
@@ -474,8 +477,8 @@ class Dense(Layer):
 
     def forward(self, input_activations, training=True):
         start_time = time.perf_counter()
-        weights = Processing.to_tensorflow(self.layer[..., :-1])
-        biases = Processing.to_tensorflow(self.layer[..., -1])
+        weights = Processing.to_tensorflow(cp.array(self.layer[..., :-1]))
+        biases = Processing.to_tensorflow(cp.array(self.layer[..., -1]))
 
         with tf.device("/GPU:1"):
             output_activations = tf.tensordot(input_activations, weights, axes=[[1], [1]]) + biases
@@ -488,8 +491,8 @@ class Dense(Layer):
         return output_activations
 
     def backward(self, input_activations, old_node_values):
-        weights = Processing.to_tensorflow(self.layer[..., :-1])
-        biases = Processing.to_tensorflow(self.layer[..., -1])
+        weights = Processing.to_tensorflow(cp.array(self.layer[..., :-1]))
+        biases = Processing.to_tensorflow(cp.array(self.layer[..., -1]))
 
         batch_size = input_activations.shape[0]
 
@@ -505,11 +508,14 @@ class Dense(Layer):
 
         return new_node_values, gradient
 
-    def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
+    def initialize(self, input_shape, initialize_weights=True, dtype=cp.float64):
         inputs = int(input_shape)
 
         if initialize_weights:
-            if (not self.variance) or self.variance == "He":
+            if isinstance(self.variance, str):
+                self.variance = self.variance.lower()
+                
+            if (not self.variance) or self.variance == "he":
                 variance = cp.sqrt(2 / (inputs))
                 self.layer = cp.random.normal(0, variance, (self.depth, inputs + 1))
 
@@ -530,16 +536,16 @@ class Dense(Layer):
 
         self.output_shape = self.depth
 
-    def update(self, optimizer, gradient, descent_values, learning_rate):
-        self.layer, new_descent_values = optimizer.apply_gradient(self.layer, gradient, descent_values, learning_rate)
+    def update(self, optimizer, gradient, descent_values, learning_rate, iteration):
+        self.layer, new_descent_values = optimizer.apply_gradient(self.layer, gradient, descent_values, learning_rate, iteration)
 
         return new_descent_values
 
     def save(self):
         return [self.depth, self.variance], self.layer.get()
 
-    def load(self, data):
-        self.layer = cp.array(data)
+    def load(self, data, dtype):
+        self.layer = cp.array(data, dtype=dtype)
 
 class Activation(Layer):
     def __init__(self, activation_function):
@@ -560,7 +566,7 @@ class Activation(Layer):
         return [self.activation_function], None
 
 class BatchNorm(Layer):
-    def __init__(self, momentum=0.9, epsilon=1e-8):
+    def __init__(self, momentum=0.9, epsilon=1e-5):
         self.momentum = momentum
         self.epsilon = epsilon
 
@@ -571,33 +577,25 @@ class BatchNorm(Layer):
 
         return self.gamma.nbytes + self.beta.nbytes + self.running_mean.nbytes + self.running_var.nbytes
 
-    def forward(self, x, training=True):
-        if x.ndim == 4:  # For 4D input [B, H, W, C]
-            axes = (0, 1, 2)  # Batch, Height, Width
-        elif x.ndim == 2:  # For 2D input [B, D]
-            axes = 0  # Batch
-        else:
-            raise ValueError("Unsupported input shape")
+    def forward(self, input_activations, training=True):
+        axes = np.arange(input_activations.ndim - 1)
 
         with tf.device("/GPU:1"):
-            if training:
-                batch_mean = tf.reduce_mean(x, axis=axes, keepdims=True)
-                batch_var = tf.math.reduce_variance(x, axis=axes, keepdims=True)
+            # if training:
+            batch_mean = tf.reduce_mean(input_activations, axis=axes, keepdims=True)
+            batch_var = tf.math.reduce_variance(input_activations, axis=axes, keepdims=True)
 
-                x_centered = x - batch_mean
+            x_centered = input_activations - batch_mean
 
-                self.stddev_inv = 1 / tf.sqrt(batch_var + self.epsilon)
-                x_norm = x_centered * self.stddev_inv
+            self.stddev_inv = 1 / tf.sqrt(batch_var + self.epsilon)
+            x_norm = x_centered * self.stddev_inv
 
-                self.batch_mean = batch_mean
-                self.batch_var = batch_var
-            else:
-                x_norm = (x - Processing.to_tensorflow(self.running_mean)) / tf.sqrt(Processing.to_tensorflow(self.running_var) + self.epsilon)
-
+            self.batch_mean = batch_mean
+            self.batch_var = batch_var
+            # else:
+            #     x_norm = (input_activations - Processing.to_tensorflow(self.running_mean)) / tf.sqrt(Processing.to_tensorflow(self.running_var) + self.epsilon)
+            
             output_activations = Processing.to_tensorflow(self.gamma) * x_norm + Processing.to_tensorflow(self.beta)
-
-        # print(self.stddev_inv, self.running_var, self.batch_mean, self.batch_var)
-        # print(tf.reduce_mean(output_activations), tf.math.reduce_variance(output_activations))
 
         if training:
             self.output_activations = output_activations
@@ -606,27 +604,23 @@ class BatchNorm(Layer):
 
     def backward(self, input_activations, old_node_values):
         batch_size = input_activations.shape[0]
-
-        if input_activations.ndim == 4:  # For convolutional layers
-            axes = (0, 1, 2)
-        else:  # For fully connected layers
-            axes = 0
-
+        axes = np.arange(input_activations.ndim - 1)
         x_centered = input_activations - self.batch_mean
         
         with tf.device("/GPU:1"):
-            gamma_gradient = x_centered * self.stddev_inv * old_node_values
-            beta_gradient = old_node_values
+            gamma_gradient = tf.reduce_mean(x_centered * self.stddev_inv * old_node_values, axis=0)
+            beta_gradient = tf.reduce_mean(old_node_values, axis=0)
 
             grad_x_norm = old_node_values * Processing.to_tensorflow(self.gamma)
-            grad_var = grad_x_norm * x_centered * -0.5 * (self.stddev_inv**3)
-            grad_mean = grad_x_norm * -self.stddev_inv + grad_var * -2 * x_centered / batch_size
 
-            new_node_values = grad_x_norm * self.stddev_inv + grad_var * 2 * x_centered / batch_size + grad_mean / batch_size
+            grad_var = grad_x_norm * x_centered * -0.5 * tf.math.pow(self.batch_var + self.epsilon, -1.5)
+            grad_mean = grad_x_norm * -self.stddev_inv + grad_var * -2 * x_centered
+
+            new_node_values = grad_x_norm / tf.sqrt(self.batch_var + self.epsilon) + grad_var * 2 * x_centered / batch_size + grad_mean / batch_size
 
             return new_node_values, [cp.array(gamma_gradient), cp.array(beta_gradient)]
 
-    def update(self, optimizer, gradient, descent_values, learning_rate):
+    def update(self, optimizer, gradient, descent_values, learning_rate, iteration):
         dgamma, dbeta = gradient
 
         if descent_values is not None:
@@ -639,34 +633,36 @@ class BatchNorm(Layer):
             self.running_mean = self.momentum * self.running_mean + cp.array((1 - self.momentum) * self.batch_mean)
             self.running_var = self.momentum * self.running_var + cp.array((1 - self.momentum) * self.batch_var)
 
-            self.gamma, new_gamma_descent_values = optimizer.apply_gradient(self.gamma, dgamma, gamma_descent_values, learning_rate)
-            self.beta, new_beta_descent_values = optimizer.apply_gradient(self.beta, dbeta, beta_descent_values, learning_rate)
+            self.gamma, new_gamma_descent_values = optimizer.apply_gradient(self.gamma, dgamma, gamma_descent_values, learning_rate, iteration)
+            self.beta, new_beta_descent_values = optimizer.apply_gradient(self.beta, dbeta, beta_descent_values, learning_rate, iteration)
 
         return [new_gamma_descent_values, new_beta_descent_values]
 
-    def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
-        if np.array(input_shape).ndim > 1:
+    def initialize(self, input_shape, initialize_weights=True, dtype=cp.float64):
+        dims = len(input_shape)
+
+        if dims > 1:
             features = np.array(input_shape)[-1]
         else:
             features = input_shape
 
         if initialize_weights:
-            self.gamma = cp.ones(features).astype(dtype)
-            self.beta = cp.zeros(features).astype(dtype)
-            self.running_mean = cp.zeros(features).astype(dtype)
-            self.running_var = cp.ones(features).astype(dtype)
+            self.gamma = cp.ones((1,) * dims + (features,)).astype(dtype)
+            self.beta = cp.zeros((1,) * dims + (features,)).astype(dtype)
+            self.running_mean = cp.zeros((1,) * dims + (features,)).astype(dtype)
+            self.running_var = cp.ones((1,) * dims + (features,)).astype(dtype)
 
         self.output_shape = input_shape
 
     def save(self):
         return [self.momentum], [self.gamma.get(), self.beta.get(), self.running_mean.get(), self.running_var.get()]
 
-    def load(self, data):
+    def load(self, data, dtype):
         self.gamma, self.beta, self.running_mean, self.running_var = data
-        self.gamma = cp.array(self.gamma)
-        self.beta = cp.array(self.beta)
-        self.running_mean = cp.array(self.running_mean)
-        self.running_var = cp.array(self.running_var)
+        self.gamma = cp.array(self.gamma, dtype=dtype)
+        self.beta = cp.array(self.beta, dtype=dtype)
+        self.running_mean = cp.array(self.running_mean, dtype=dtype)
+        self.running_var = cp.array(self.running_var, dtype=dtype)
 
 class Input(Layer):
     def __init__(self, input_shape):
@@ -679,15 +675,15 @@ class Input(Layer):
 
         return output_activations
 
-    def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
+    def initialize(self, input_shape, initialize_weights=True, dtype=cp.float64):
         self.dtype = dtype
         self.output_shape = input_shape
 
     def save(self):
-        return [self.output_shape], self.dtype
+        return [self.output_shape], None
 
-    def load(self, data):
-        self.dtype = data
+    def load(self, data, dtype):
+        self.dtype = dtype
 
 class Flatten(Layer):
     def __init__(self):
@@ -705,7 +701,7 @@ class Flatten(Layer):
     def backward(self, input_activations, node_values):
         return tf.reshape(node_values, self.input_shape), []
 
-    def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
+    def initialize(self, input_shape, initialize_weights=True, dtype=cp.float64):
         self.output_shape = input_shape.prod()
 
 class Reshape(Layer):
@@ -750,7 +746,7 @@ class Space2Depth(Layer):
                     self.block_size
                 ), []
 
-    def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
+    def initialize(self, input_shape, initialize_weights=True, dtype=cp.float64):
         self.output_shape = input_shape[:]
         self.output_shape[-1] *= self.block_size ** 2
         self.output_shape[:-1] //= self.block_size

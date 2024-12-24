@@ -1,15 +1,14 @@
 import tensorflow.compat.v1 as cp, numpy as np, cupy as cp
 
 
-epsilon = 10e-5
-
-
 class Adam:
-    def __init__(self, momentum = 0.9, beta_constant = 0.99):
+    def __init__(self, momentum = 0.9, beta_constant = 0.99, weight_decay = 0, epsilon = 10e-8):
         self.momentum_constant = momentum
-        self.adam_constant = beta_constant
+        self.beta_constant = beta_constant
+        self.weight_decay = weight_decay
+        self.epsilon = epsilon
 
-    def apply_gradient(self, values, gradient, descent_values, learning_rate):
+    def apply_gradient(self, values, gradient, descent_values, learning_rate, iteration):
         if not (descent_values is None):
             momentum, squared_momentum = descent_values
 
@@ -18,37 +17,46 @@ class Adam:
             momentum = 0
 
         new_gradient_momentum = (self.momentum_constant * momentum) + (1 - self.momentum_constant) * gradient
-        new_squared_momentum = (self.adam_constant * squared_momentum) + (1 - self.adam_constant) * (gradient ** 2)
+        new_squared_momentum = (self.beta_constant * squared_momentum) + (1 - self.beta_constant) * (gradient ** 2)
 
-        new_values = values - learning_rate * (new_gradient_momentum / (cp.sqrt(new_squared_momentum + epsilon)))
+        # new_gradient_momentum /= (1 - self.momentum_constant ** (iteration + 1))
+        # new_squared_momentum /= (1 - self.beta_constant ** (iteration + 1))
+
+        new_values = values - learning_rate * (new_gradient_momentum / cp.sqrt(new_squared_momentum + self.epsilon))
         new_descent_values = [new_gradient_momentum, new_squared_momentum]
+
+        new_values -= values * self.weight_decay
 
         return new_values, new_descent_values
                 
 class RMSProp:
-    def __init__(self, beta_constant = 0.99):
-        self.adam_constant = beta_constant
+    def __init__(self, beta_constant = 0.9, weight_decay = 0, epsilon = 10e-8):
+        self.beta_constant = beta_constant
+        self.weight_decay = weight_decay
+        self.epsilon = epsilon
 
-    def apply_gradient(self, values, gradient, descent_values, learning_rate):
+    def apply_gradient(self, values, gradient, descent_values, learning_rate, iteration):
         if not (descent_values is None):
             squared_momentum = descent_values
 
         else:
-            squared_momentum = 0
+            squared_momentum = cp.zeros_like(values)
 
         new_squared_momentum = (self.beta_constant * squared_momentum) + (1 - self.beta_constant) * (gradient ** 2)
-        new_squared_momentum = new_squared_momentum / (1 - self.beta_constant ** generation)
 
-        new_values = values - learning_rate * (gradient / (cp.sqrt(new_squared_momentum + epsilon)))
+        new_values = values - learning_rate * (gradient / cp.sqrt(new_squared_momentum + self.epsilon))
         new_descent_values = new_squared_momentum
+
+        new_values -= values * self.weight_decay
 
         return new_values, new_descent_values
 
 class Momentum:
-    def __init__(self, momentum = 0.9):
+    def __init__(self, momentum = 0.9, weight_decay = 0):
         self.momentum_constant = momentum
+        self.weight_decay = weight_decay
 
-    def apply_gradient(self, values, gradient, descent_values, learning_rate):
+    def apply_gradient(self, values, gradient, descent_values, learning_rate, iteration):
 
         if not (descent_values is None):
             momentum = descent_values
@@ -61,15 +69,16 @@ class Momentum:
         new_values = values - change
         new_descent_values = change
 
+        new_values -= values * self.weight_decay
+
         return new_values, new_descent_values
 
 class SGD:
-    def __init__(self):
-        pass
+    def __init__(self, weight_decay = 0):
+        self.weight_decay = weight_decay
 
-    def apply_gradient(self, values, gradient, descent_values, learning_rate):
-        gradient = gradient.copy()
-        gradient *= learning_rate
-        new_values = values - gradient
+    def apply_gradient(self, values, gradient, descent_values, learning_rate, iteration):
+        new_values = values - (gradient * learning_rate)
+        new_values -= values * self.weight_decay
 
         return new_values, None
