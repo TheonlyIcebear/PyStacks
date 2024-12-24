@@ -1,5 +1,4 @@
-import multiprocessing, threading, cupy as cp, awkward as ak, utils.layers, pickle, time, copy, math, gc, os
-from tqdm.auto import tqdm, trange
+import cupy as cp, utils.layers, time, math, os
 from datetime import datetime
 from utils.optimizers import *
 from utils.activations import *
@@ -11,8 +10,6 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 import tensorflow.compat.v1 as tf
-from multiprocessing import Manager, Pool, Queue
-from multiprocessing.shared_memory import SharedMemory
 
 class Network:
     def __init__(self, model=[], backprop_layer_indices=[-1], addon_layers=[], loss_function=MSE(), optimizer=SGD(), gpu_mem_frac=1, dtype=np.float32, scheduler=None):
@@ -203,7 +200,6 @@ class Network:
         node_values = []
 
         cost = loss_function.forward(outputs, expected_outputs).numpy().astype(self.dtype)
-        print(cost)
         node_values = tf.cast(loss_function.backward(outputs, expected_outputs), self.dtype)
 
         return cost, node_values
