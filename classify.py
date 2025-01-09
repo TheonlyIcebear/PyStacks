@@ -107,7 +107,7 @@ if __name__ == "__main__":
         Activation(Softmax())
     ]
 
-    network = Network(model, loss_function=CrossEntropy(), optimizer=Adam(momentum = 0.8, beta_constant = 0.9), scheduler=StepLR(initial_learning_rate=0.0001, decay_rate=0.5, decay_interval=5))
+    network = Network(model, dtype=cp.float32, loss_function=CrossEntropy(), optimizer=Adam(momentum = 0.9, beta_constant = 0.99), scheduler=StepLR(initial_learning_rate=0.00005, decay_rate=0.5, decay_interval=5))
     network.compile()
 
     save_file = 'model-training-data.json'

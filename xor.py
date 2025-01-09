@@ -11,14 +11,14 @@ if __name__ == "__main__":
     model = [
         Input(2),
         Dense(3),
-        Activation(Silu()),
+        Activation(Mish()),
         Dense(2),
-        Activation(Softmax()),
+        Activation(Sigmoid()),
     ]
 
     print(model)
 
-    network = Network(model, loss_function=CrossEntropy(), optimizer=Adam(momentum = 0.7, beta_constant = 0.8))
+    network = Network(model, loss_function=BCE(), optimizer=Adam(momentum = 0.7, beta_constant = 0.8))
     network.compile()
     
     training_percent = 1
@@ -27,7 +27,8 @@ if __name__ == "__main__":
     save_file = 'model-training-data.json'
 
     xdata = [[i % 2, i // 2] for i in range(4)]
-    ydata = [[(i % 2) ^ (i // 2), 1 - ((i % 2) ^ (i // 2))] for i in range(4)]
+    ydata = [[[(i % 2) ^ (i // 2), 1 - ((i % 2) ^ (i // 2))]] for i in range(4)]
+
 
     costs = []
     plt.ion()
