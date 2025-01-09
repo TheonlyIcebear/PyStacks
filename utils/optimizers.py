@@ -25,7 +25,7 @@ class Adam:
         new_values = values - learning_rate * (new_gradient_momentum / cp.sqrt(new_squared_momentum + self.epsilon))
         new_descent_values = [new_gradient_momentum, new_squared_momentum]
 
-        new_values -= values * self.weight_decay
+        new_values -= values * self.weight_decay * learning_rate
 
         return new_values, new_descent_values
                 
@@ -47,7 +47,7 @@ class RMSProp:
         new_values = values - learning_rate * (gradient / cp.sqrt(new_squared_momentum + self.epsilon))
         new_descent_values = new_squared_momentum
 
-        new_values -= values * self.weight_decay
+        new_values -= values * self.weight_decay * learning_rate
 
         return new_values, new_descent_values
 
@@ -69,7 +69,7 @@ class Momentum:
         new_values = values - change
         new_descent_values = change
 
-        new_values -= values * self.weight_decay
+        new_values -= values * self.weight_decay * learning_rate
 
         return new_values, new_descent_values
 
@@ -79,6 +79,6 @@ class SGD:
 
     def apply_gradient(self, values, gradient, descent_values, learning_rate, iteration):
         new_values = values - (gradient * learning_rate)
-        new_values -= values * self.weight_decay
+        new_values -= values * self.weight_decay * learning_rate
 
         return new_values, None

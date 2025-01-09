@@ -6,13 +6,13 @@ from utils.loss import *
 from utils.functions import Processing
 
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 import tensorflow.compat.v1 as tf
 
 class Network:
-    def __init__(self, model=[], backprop_layer_indices=[-1], addon_layers=[], loss_function=MSE(), optimizer=SGD(), gpu_mem_frac=1, dtype=np.float32, scheduler=None):
+    def __init__(self, model=[], backprop_layer_indices=[-1], addon_layers=[], loss_function=MSE(), optimizer=SGD(), gpu_mem_frac=1, dtype=np.float64, scheduler=None):
         self.model = model
         self.loss_functions = loss_function if isinstance(loss_function, list) else [loss_function] * len(backprop_layer_indices)
         self.optimizer = optimizer
@@ -26,6 +26,8 @@ class Network:
         self.starting_epoch = 0
 
         physical_gpus = tf.config.experimental.list_physical_devices('GPU')
+
+        print(physical_gpus)
 
         if physical_gpus:
             device = cp.cuda.Device(0)  # Assuming GPU index 0
@@ -86,7 +88,7 @@ class Network:
                         layer.initialize(_input_shape, dtype=self.dtype)
                         _input_shape = layer.output_shape.copy()
 
-                        print(layer, input_shape, "ADDON")
+                        print(layer, _input_shape, "ADDON")
 
         labels = {
             0: 'B',
@@ -199,10 +201,23 @@ class Network:
         costs = []
         node_values = []
 
-        cost = loss_function.forward(outputs, expected_outputs).numpy().astype(self.dtype)
-        node_values = tf.cast(loss_function.backward(outputs, expected_outputs), self.dtype)
+        outputs = tf.constant(outputs, dtype=self.dtype)
+        expected_outputs = tf.constant(expected_outputs, dtype=self.dtype)
 
-        return cost, node_values
+        with tf.GradientTape() as tape:
+            tape.watch(outputs)
+            cost = loss_function.forward(outputs, expected_outputs)
+
+            if isinstance(cost, tuple):
+                true_cost = cost[1]
+                cost = cost[0]
+            else:
+                true_cost = cost
+
+        node_values = tape.gradient(cost, outputs)
+        print(node_values[..., ::5])
+
+        return true_cost.numpy().astype(self.dtype), node_values
 
     def backward(self, outputs, expected_outputs):
         node_values = None
@@ -242,12 +257,7 @@ class Network:
                         for idx, addon_layer in enumerate(self.addon_layers[addon_index][::-1]):
                             current_layer_addon_index = -(idx + 1)
 
-                            if idx + 1 == len(self.addon_layers[addon_index]): # Input activations are stored outside of addon block
-                                input_activations = layer.output_activations
-                            else:
-                                input_activations = self.addon_layers[addon_index][current_layer_addon_index - 1].output_activations
-
-                            _node_values, gradient = addon_layer.backward(input_activations, _node_values)
+                            _node_values, gradient = addon_layer.backward(_node_values)
                             addon_gradient[current_layer_addon_index] = gradient
 
                         addon_gradients[addon_index] = addon_gradient
@@ -260,13 +270,12 @@ class Network:
                 if node_values is None:
                     continue
 
-                input_activations = self.model[current_layer_index - 1].output_activations
-                node_values, gradient = layer.backward(input_activations, node_values)
+                node_values, gradient = layer.backward(node_values)
                 gradients[current_layer_index] = gradient
 
                 time2 = time.perf_counter()
 
-                del input_activations, layer.output_activations, gradient
+                del gradient
 
         return gradients, addon_gradients, costs[::-1]
 
@@ -335,7 +344,9 @@ class Network:
             learning_rate = self.learning_rate
 
         if (gradient_transformer is not None) and not isinstance(gradient_transformer, list):
-            gradient_transformer = [gradient_transformer]
+            gradient_transformer = (gradient_transformer,)
+
+        print(gradient_transformer, (gradient_transformer is not None), not isinstance(gradient_transformer, list))
 
         iterations = int(epochs * (dataset_size / batch_size))
 
@@ -372,6 +383,8 @@ class Network:
             outputs = self.forward(selected_xdata)
             gradient, addon_gradients, cost = self.backward(outputs, selected_ydata)
 
+            print(1)
+
             del selected_xdata, selected_ydata
 
             if gradient_transformer:
@@ -394,6 +407,8 @@ class Network:
 
                 self.optimizer_values[idx] = new_descent_values
                 del new_descent_values
+
+            print(2)
 
             del gradient
 

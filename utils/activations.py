@@ -140,7 +140,6 @@ class YoloActivation:
         x_reshaped = cp.array(x).reshape((-1, 5))
 
         x_reshaped[..., [0, 1, 2]] = Sigmoid.forward(Processing.to_tensorflow(x_reshaped[..., [0, 1, 2]]))
-        # x_reshaped[..., [3, 4]] = cp.exp(x_reshaped[..., [3, 4]])
         x_reshaped = x_reshaped.reshape(x.shape)
 
         return Processing.to_tensorflow(x_reshaped)
@@ -150,7 +149,6 @@ class YoloActivation:
         x_deriv = cp.ones(x_reshaped.shape, dtype=x_reshaped.dtype)
 
         x_deriv[..., [0, 1, 2]] = Sigmoid.backward(Processing.to_tensorflow(x_reshaped[..., [0, 1, 2]]))
-        # x_deriv[..., [3, 4]] = x_reshaped[..., [3, 4]]
         x_deriv = x_deriv.reshape(x.shape)
 
         return Processing.to_tensorflow(x_deriv)
