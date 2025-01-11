@@ -215,7 +215,7 @@ class Network:
                 true_cost = cost
 
         node_values = tape.gradient(cost, outputs)
-        print(node_values[..., ::5])
+        print(node_values)
 
         return true_cost.numpy().astype(self.dtype), node_values
 
@@ -266,6 +266,8 @@ class Network:
                         node_values += _node_values
                     else:
                         node_values = _node_values
+
+                    del _node_values, indexed_expected_outputs, output, cost, addon_gradient
 
                 if node_values is None:
                     continue
