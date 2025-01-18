@@ -1,7 +1,7 @@
 from utils.layers import *
 from utils.schedulers import *
 from utils.network import Network
-from utils.optimizers import Adam
+from utils.optimizers import SGD, Adam
 from utils.activations import *
 from utils.loss import *
 import matplotlib.pyplot as plt
@@ -11,14 +11,14 @@ if __name__ == "__main__":
     model = [
         Input(2),
         Dense(3),
-        Activation(Mish()),
+        LRelu(),
         Dense(2),
-        Activation(Sigmoid()),
+        Softmax(),
     ]
 
     print(model)
 
-    network = Network(model, loss_function=BCE(), optimizer=Adam(momentum = 0.7, beta_constant = 0.8))
+    network = Network(model, loss_function=CrossEntropy(), optimizer=Adam(momentum=0.9, beta_constant=0.99))
     network.compile()
     
     training_percent = 1
@@ -33,8 +33,10 @@ if __name__ == "__main__":
     costs = []
     plt.ion()
 
-    for idx, cost in enumerate(network.fit(xdata, ydata, learning_rate=0.01, batch_size = batch_size, epochs = 1000)):
+    for idx, cost in enumerate(network.fit(xdata, ydata, learning_rate=0.01, batch_size = batch_size, epochs = 100000)):
         costs.append(cost)
+
+        print(cost)
 
         if not idx % 10:
             plt.plot(np.arange(len(costs)) * (batch_size / (len(xdata) * training_percent)), costs, label='training')

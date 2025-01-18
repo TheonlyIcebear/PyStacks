@@ -1,4 +1,4 @@
-import tensorflow.compat.v1 as cp, numpy as np, cupy as cp
+import tensorflow.compat.v1 as tf, numpy as np, cupy as cp
 
 
 class Adam:
@@ -22,7 +22,7 @@ class Adam:
         # new_gradient_momentum /= (1 - self.momentum_constant ** (iteration + 1))
         # new_squared_momentum /= (1 - self.beta_constant ** (iteration + 1))
 
-        new_values = values - learning_rate * (new_gradient_momentum / cp.sqrt(new_squared_momentum + self.epsilon))
+        new_values = values - learning_rate * (new_gradient_momentum / tf.sqrt(new_squared_momentum + self.epsilon))
         new_descent_values = [new_gradient_momentum, new_squared_momentum]
 
         new_values -= values * self.weight_decay * learning_rate
@@ -40,11 +40,11 @@ class RMSProp:
             squared_momentum = descent_values
 
         else:
-            squared_momentum = cp.zeros_like(values)
+            squared_momentum = tf.zeros_like(values)
 
         new_squared_momentum = (self.beta_constant * squared_momentum) + (1 - self.beta_constant) * (gradient ** 2)
 
-        new_values = values - learning_rate * (gradient / cp.sqrt(new_squared_momentum + self.epsilon))
+        new_values = values - learning_rate * (gradient / tf.sqrt(new_squared_momentum + self.epsilon))
         new_descent_values = new_squared_momentum
 
         new_values -= values * self.weight_decay * learning_rate

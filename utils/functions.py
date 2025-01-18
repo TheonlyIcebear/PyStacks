@@ -1,8 +1,7 @@
 from functools import partial
 import numpy as np, cupy as cp, time
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 from PIL import Image, ImageTk, ImageDraw
-from tensorflow.experimental.dlpack import from_dlpack, to_dlpack
 
 class Processing:
     def iou(boxes1, boxes2, api=cp):
@@ -19,8 +18,8 @@ class Processing:
         bottom_right_x = api.minimum(boxes1_bottom_right[..., 0:1], boxes2_bottom_right[..., 0])
         bottom_right_y = api.minimum(boxes1_bottom_right[..., 1:2], boxes2_bottom_right[..., 1])
 
-        intersection_width = api.maximum(0, bottom_right_x - top_left_x)
-        intersection_height = api.maximum(0, bottom_right_y - top_left_y)
+        intersection_width = api.maximum(0.0, bottom_right_x - top_left_x)
+        intersection_height = api.maximum(0.0, bottom_right_y - top_left_y)
         intersection_area = intersection_width * intersection_height
 
         boxes1_area = (boxes1_bottom_right[..., 0] - boxes1_top_left[..., 0]) * (boxes1_bottom_right[..., 1] - boxes1_top_left[..., 1])
@@ -31,14 +30,6 @@ class Processing:
         iou = intersection_area / api.maximum(union_area, 1e-6)  # Avoid division by zero
 
         return iou
-
-    def to_tensorflow(array):
-        array = from_dlpack(cp.ascontiguousarray(array).toDlpack())
-        return array
-
-    def to_cupy(array):
-        array = cp.from_dlpack(to_dlpack(array))
-        return array
 
 class ClipGradient:
     def __init__(self, clip_norm):
@@ -51,28 +42,22 @@ class ClipGradient:
                     continue
 
                 # Convert to float64 then back since it's more numerically stable
-                dtype = gradient[idx].dtype
-                gradient[idx] = gradient[idx].astype(cp.float64)
-                gradient[idx] = self._clip_by_norm(gradient[idx] + 1.0e-8, self.clip_norm)
-                gradient[idx] = cp.nan_to_num(gradient[idx].astype(dtype), 0, 0, 0)
+                gradient[idx] = tf.clip_by_norm(gradient[idx] + 1.0e-8, self.clip_norm)
 
             else:
                 gradient[idx] = self._clip_gradient(layer)
 
         return gradient
-
-    def _clip_by_norm(self, gradient, clip_norm):
-        return gradient * cp.minimum(1.0, clip_norm / (self._get_norm(gradient) + 1e-8))
         
     def _get_norm(self, gradient):
         dtype = gradient.dtype
-        gradient = gradient.astype(cp.float64)
+        gradient = tf.cast(gradient, tf.float64)
 
-        l2sum = cp.sum(gradient * gradient)
-        l2sum = cp.nan_to_num(l2sum, 1, 1, 1)
-        l2norm = cp.sqrt(l2sum)
+        l2sum = tf.math.reduce_sum(gradient * gradient, keepdims=True)
+        pred = l2sum > 0
+        l2sum_safe = tf.where(pred, l2sum, tf.ones_like(l2sum))
 
-        return l2norm.astype(dtype)
+        return tf.cast(l2sum_safe, dtype)
 
     def forward(self, gradient):
         return self._clip_gradient(gradient)
@@ -104,13 +89,13 @@ class AutoClipper:
 
     def _get_norm(self, gradient):
         dtype = gradient.dtype
-        gradient = gradient.astype(cp.float64)
-        
-        l2sum = cp.sum(gradient * gradient)
-        l2sum = cp.nan_to_num(l2sum, 1, 1, 1)
-        l2norm = cp.sqrt(l2sum)
+        gradient = tf.cast(gradient, tf.float64)
 
-        return l2norm.astype(dtype)
+        l2sum = tf.math.reduce_sum(gradient * gradient, keepdims=True)
+        pred = l2sum > 0
+        l2sum_safe = tf.where(pred, l2sum, tf.ones_like(l2sum))
+
+        return tf.cast(tf.squeeze(tf.where(pred, tf.math.sqrt(l2sum_safe), l2sum)), dtype)
 
     def _clip_gradient(self, gradient, clip_norm):
         for idx, layer in enumerate(gradient):
@@ -119,19 +104,12 @@ class AutoClipper:
                     continue
 
                 # Convert to float64 then back since it's more numerically stable
-                dtype = gradient[idx].dtype
-                gradient[idx] = gradient[idx].astype(cp.float64)
-                gradient[idx] = self._clip_by_norm(gradient[idx] + 1.0e-8, clip_norm)
-                gradient[idx] = cp.nan_to_num(gradient[idx].astype(dtype), 0, 0, 0)
+                gradient[idx] = tf.clip_by_norm(gradient[idx] + 1.0e-8, clip_norm)
 
             else:
                 gradient[idx] = self._clip_gradient(layer, clip_norm)
 
         return gradient
-
-    def _clip_by_norm(self, gradient, clip_norm):
-        l2norm = self._get_norm(gradient)
-        return gradient * cp.minimum(1.0, clip_norm / (l2norm + 1e-8))
 
     def forward(self, gradient):
         total_norm = self._get_total_norm(gradient)
@@ -139,7 +117,7 @@ class AutoClipper:
         self.norm_history[self.iteration % self.history_size] = total_norm
         self.iteration += 1
 
-        clip_norm = cp.percentile(self.norm_history[:self.iteration], q=self.percentile)
+        clip_norm = Processing.to_tensorflow(cp.percentile(cp.array(self.norm_history[:self.iteration]), q=self.percentile))
 
         print("[LOG] Clip Value:", clip_norm)
         

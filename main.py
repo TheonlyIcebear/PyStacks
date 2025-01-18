@@ -11,139 +11,173 @@ from tqdm import tqdm
 import matplotlib.animation as animation
 from matplotlib.ticker import MaxNLocator
 import albumentations as A, matplotlib.pyplot as plt
-import threading, numpy as np, pickle, time, json, cv2, os
+import multiprocessing, threading, numpy as np, pickle, time, json, cv2, os
 
 class Generate:
-    def __init__(self, batch_size, anchor_dimensions, choices):
+    def __init__(self, batch_size, anchor_dimensions, dimensions, grid_size, anchors, choices, iou_ignore_threshold = 0.72, data_augmentation=True):
         self.batch_size = batch_size
+
         self.anchor_dimensions = anchor_dimensions
+        self.data_augmentation = data_augmentation
+
+        self.image_width, self.image_height = dimensions
+
         self.dataset_size = len(choices)
         self.choices = choices
 
-    def get(self):
-        choices = np.random.choice(self.choices, size=self.batch_size, replace=False)
-        xdatas = []
-        ydatas = []
+        manager = multiprocessing.Manager()
+        self.buffer = manager.list()
+        self.buffer_size = batch_size
 
-        augmenter = A.Compose([
+        self.grid_size = grid_size
+        self.anchors = anchors
+
+        self.iou_ignore_threshold = iou_ignore_threshold
+
+        multiprocessing.Process(target=self.fill_buffer).start()
+
+    def fill_buffer(self):
+        augmentor = A.Compose([
             A.HorizontalFlip(p=0.5),
+            A.HueSaturationValue(hue_shift_limit=(-5.0, 5.0), sat_shift_limit=(-5.0, 5.0), val_shift_limit=(-5.0, 5.0), p=0.5),
 
-            A.HueSaturationValue(hue_shift_limit=(-2, 2), sat_shift_limit=(-10, 10), val_shift_limit=(-10, 10), p=0.25),
-            A.ColorJitter(brightness=(0.9, 1.1), contrast=(0.9, 1.1), saturation=(0.9, 1.1), hue=(-0.1, 0.1), p=0.25),
-
-            A.Affine(
-                rotate=(-2.5, 2.5),
-                translate_percent=(-0.05, 0.1),
+            A.Affine( 
+                rotate=(-1, 1),
+                translate_percent=(-0.05, 0.05),
                 rotate_method="largest_box",
                 keep_ratio=True,
                 balanced_scale=True,
-                p=0.3,
+                p=0.5,
                 border_mode=cv2.BORDER_REFLECT
             ),
 
+            A.Perspective(scale=(0.05, 0.1), p=0.5),
+
             A.GridDistortion(
-                num_steps=3, 
-                distort_limit=0.3,
+                num_steps=5, 
+                distort_limit=(-0.2, 0.2),
                 normalized=True,
-                p=0.3
+                p=0.5
             ),
-
-            A.Perspective(scale=(0.05, 0.1), p=0.3),
-            A.MotionBlur(blur_limit=(1, 3), p=0.1),
-
-            A.AdditiveNoise(
-                noise_type="uniform",
-                spatial_mode="shared",
-                noise_params={"ranges": [(-0.05, 0.05)]},
-                p=0.1
-            ),
+        
 
         ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.25, label_fields=['class_labels']))
-
-        filenames = np.array(os.listdir('gameplay'))[choices]
-        for filename in filenames:
-            locations_filename = f'annotations\\{filename.replace(".png", ".txt")}'
-
-            if os.path.exists(locations_filename):
-                with open(locations_filename, "r+") as file:
-                    lines = file.read().splitlines()
-                    location_data = np.array([
-                        [
-                            np.float64(value) for value in line.split(' ')[1:]
-                        ] for line in lines
-                    ], dtype=np.float64)
-
-                location_data = location_data[:objects]
-                objects_present = location_data.shape[0]
-
-            else:
-                print("[LOG] Empty image detected")
+        
+        while True:
+            if len(self.buffer) >= self.buffer_size:
                 continue
 
-            location_data += 10e-8
+            choices = np.random.choice(self.choices, size=self.buffer_size - len(self.buffer), replace=False)
 
-            try:
-                root_image = cv2.resize(
-                                cv2.cvtColor(
-                                        cv2.imread(f'gameplay\\{filename}'), 
-                                        cv2.COLOR_BGR2RGB
-                                    ), (image_width, image_height)
-                                )
-            except Exception as e:
-                print(filename, e, "[LOG] BROKEN")
-                continue
+            filenames = np.array(os.listdir('gameplay'))[choices]
 
-            classes = ['enemy'] * len(location_data)
+            buffer_extension = []
 
-            augmented_result = augmenter(image=root_image, bboxes=location_data, class_labels=classes)
-            image = augmented_result['image']
-            bboxes = np.array(augmented_result['bboxes'])
+            for idx, filename in enumerate(filenames):
+                locations_filename = f'annotations\\{filename.replace(".png", ".txt")}'
 
-            xdata = np.array(image)
-            ydata = [np.zeros((grid_size * 2 ** i, grid_size * 2 ** i, anchors, 5)) for i in range(len(backprop_layer_indices))]
+                if os.path.exists(locations_filename):
+                    with open(locations_filename, "r+") as file:
+                        lines = file.read().splitlines()
+                        location_data = np.array([
+                            [
+                                np.float64(value) for value in line.split(' ')[1:]
+                            ] for line in lines
+                        ], dtype=np.float64)
 
-            for (true_center_x, true_center_y, width, height) in bboxes:
-                formatted_anchor_dimensions = np.concatenate(
-                    (np.full((self.anchor_dimensions.shape[0], 2), 0), 
-                    self.anchor_dimensions
-                ), axis=-1), # [[0, 0, w, h], ...]
+                    objects_present = location_data.shape[0]
 
-                iou_values = Processing.iou(
-                    cp.array(formatted_anchor_dimensions),
-                    cp.array([0, 0, width, height])
-                )[0, :, 0].get()
+                else:
+                    print("[LOG] Empty image detected")
+                    continue
 
-                anchor_indices = iou_values.argsort()[::-1]
+                location_data += 10e-8
 
-                has_anchor = [False, False, False]
+                try:
+                    root_image = cv2.resize(
+                                    cv2.cvtColor(
+                                            cv2.imread(f'gameplay\\{filename}'), 
+                                            cv2.COLOR_BGR2RGB
+                                        ), (self.image_width, self.image_height)
+                                    )
+                except Exception as e:
+                    print(filename, e, "[LOG] BROKEN")
+                    continue
 
-                for anchor_index in anchor_indices:
-                    scale_idx = anchor_index // anchors
-                    anchor_on_scale = anchor_index % anchors
+                classes = ['enemy'] * len(location_data)
 
-                    _grid_size = grid_size * 2 ** scale_idx
+                if self.data_augmentation:
+                    augmented_result = augmentor(image=root_image, bboxes=location_data, class_labels=classes)
+                    bboxes = np.array(augmented_result['bboxes'])
+                    image = augmented_result['image']
 
-                    _width = np.log(width / self.anchor_dimensions[anchor_index, 0])
-                    _height = np.log(height / self.anchor_dimensions[anchor_index, 1])
+                else:
+                    bboxes = np.array(location_data)
+                    image = root_image
 
-                    grid_x_index = int(true_center_x * _grid_size)
-                    grid_y_index = int(true_center_y * _grid_size)
+                image = image / 255
 
-                    relative_center_x = true_center_x * _grid_size - grid_x_index
-                    relative_center_y = true_center_y * _grid_size - grid_y_index
+                ydata = [np.zeros((self.grid_size * 2 ** i, self.grid_size * 2 ** i, self.anchors, 5)) for i in range(3)]
 
-                    occupied = ydata[scale_idx][grid_x_index, grid_y_index, anchor_on_scale, 0]
-                    if not occupied and not has_anchor[scale_idx]:
-                        has_anchor[scale_idx] = True
-                        ydata[scale_idx][grid_x_index, grid_y_index, anchor_on_scale] = [1, relative_center_x, relative_center_y, _width, _height]
+                for (true_center_x, true_center_y, width, height) in bboxes:
+                    formatted_anchor_dimensions = np.concatenate(
+                        (np.full((self.anchor_dimensions.shape[0], 2), 0), 
+                        self.anchor_dimensions
+                    ), axis=-1), # [[0, 0, w, h], ...]
 
-                    elif not occupied and iou_values[anchor_index] > iou_ignore_threshold:
-                        ydata[scale_idx][grid_x_index, grid_y_index, anchor_on_scale, 0] = -1
-                
-            ydata = [scale.flatten() for scale in ydata]
+                    iou_values = Processing.iou(
+                        cp.array(formatted_anchor_dimensions),
+                        cp.array([0, 0, width, height])
+                    )[0, :, 0].get()
+
+                    anchor_indices = iou_values.argsort()[::-1]
+
+                    has_anchor = [False, False, False]
+
+                    for anchor_index in anchor_indices:
+                        scale_idx = anchor_index // self.anchors
+                        anchor_on_scale = anchor_index % self.anchors
+
+                        _grid_size = self.grid_size * 2 ** scale_idx
+
+                        _width = np.log(width / self.anchor_dimensions[anchor_index, 0])
+                        _height = np.log(height / self.anchor_dimensions[anchor_index, 1])
+
+                        grid_x_index = int(true_center_x * _grid_size)
+                        grid_y_index = int(true_center_y * _grid_size)
+
+                        relative_center_x = true_center_x * _grid_size - grid_x_index
+                        relative_center_y = true_center_y * _grid_size - grid_y_index
+
+                        occupied = ydata[scale_idx][grid_x_index, grid_y_index, anchor_on_scale, 0]
+                        if not occupied and not has_anchor[scale_idx]:
+                            has_anchor[scale_idx] = True
+                            ydata[scale_idx][grid_x_index, grid_y_index, anchor_on_scale] = [1, relative_center_x, relative_center_y, _width, _height]
+
+                        elif not occupied and iou_values[anchor_index] > self.iou_ignore_threshold:
+                            ydata[scale_idx][grid_x_index, grid_y_index, anchor_on_scale, 0] = -1
+                    
+                ydata = [scale.reshape(self.grid_size * 2 ** i, self.grid_size * 2 ** i, self.anchors * 5) for i, scale in enumerate(ydata)]
+                buffer_extension.append((image, ydata))
+
+            self.buffer += buffer_extension
+
+    def __call__(self):
+        choices = np.random.choice(self.choices, size=self.batch_size, replace=False)
+        
+        xdatas = []
+        ydatas = []
+
+        while len(self.buffer) < self.batch_size:
+            pass
+
+        for idx in range(self.batch_size):
+            xdata, ydata = self.buffer[idx]
 
             xdatas.append(xdata)
             ydatas.append(ydata)
+
+        del self.buffer[:self.batch_size]
 
         return np.array(xdatas), ydatas
 
@@ -220,41 +254,31 @@ def parse_output(outputs, grid_size, anchor_dimensions):
     return box_data
 
 def get_bboxes(choices):
-    bboxes = np.empty((0, 5))
-    images = []
+    bboxes = np.empty((0, 4))
 
     augmenter = A.Compose([
         A.HorizontalFlip(p=0.5),
+        A.HueSaturationValue(hue_shift_limit=(-5.0, 5.0), sat_shift_limit=(-5.0, 5.0), val_shift_limit=(-5.0, 5.0), p=0.5),
 
-        A.HueSaturationValue(hue_shift_limit=(-2, 2), sat_shift_limit=(-10, 10), val_shift_limit=(-10, 10), p=0.25),
-        A.ColorJitter(brightness=(0.9, 1.1), contrast=(0.9, 1.1), saturation=(0.9, 1.1), hue=(-0.1, 0.1), p=0.25),
-
-        A.Affine(
-            rotate=(-2.5, 2.5),
-            translate_percent=(-0.05, 0.1),
+        A.Affine( 
+            rotate=(-1, 1),
+            translate_percent=(-0.05, 0.05),
             rotate_method="largest_box",
             keep_ratio=True,
             balanced_scale=True,
-            p=0.3,
+            p=0.5,
             border_mode=cv2.BORDER_REFLECT
         ),
 
+        A.Perspective(scale=(0.05, 0.1), p=0.5),
+
         A.GridDistortion(
-            num_steps=3, 
-            distort_limit=0.3,
+            num_steps=5, 
+            distort_limit=(-0.2, 0.2),
             normalized=True,
-            p=0.3
+            p=0.5
         ),
-
-        A.Perspective(scale=(0.05, 0.1), p=0.3),
-        A.MotionBlur(blur_limit=(1, 3), p=0.1),
-
-        A.AdditiveNoise(
-            noise_type="uniform",
-            spatial_mode="shared",
-            noise_params={"ranges": [(-0.05, 0.05)]},
-            p=0.1
-        ),
+    
 
     ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.25, label_fields=['class_labels']))
 
@@ -290,37 +314,31 @@ def get_bboxes(choices):
             print(filename, e, "[LOG] BROKEN")
             continue
 
-        for i in range(repeats):
-            if (location_data.shape[0] != 0):
+        if (location_data.shape[0] != 0):
 
-                classes = ['enemy'] * len(location_data)
+            classes = ['enemy'] * len(location_data)
 
-                augmented_result = augmenter(image=root_image, bboxes=location_data, class_labels=classes)
-                image = augmented_result['image']
-                _bboxes = np.array(augmented_result['bboxes'])
+            augmented_result = augmenter(image=root_image, bboxes=location_data, class_labels=classes)
+            image = augmented_result['image']
+            _bboxes = np.array(augmented_result['bboxes'])
 
-                # image = root_image
-                # _bboxes = location_data
+            # image = root_image
+            # _bboxes = location_data
 
-                images.append(image / 255)
-                
-                indices = np.repeat(idx * repeats + i, _bboxes.size // 4)[:, None]
-                _bboxes = np.hstack((indices, _bboxes.reshape((-1, 4))))
+            bboxes = np.concatenate((bboxes, _bboxes))
 
-                bboxes = np.concatenate((bboxes, _bboxes))
-
-    return bboxes, np.array(images)
+    return bboxes
 
 def get_anchor_data(grid_size, bboxes):
 
     # BBoxes Format: [idx, x, y, w, h]
 
     if len(bboxes) < 3 * anchors:
-        print(np.tile(bboxes[0][3:], (3 * anchors, 1)))
-        return np.tile(bboxes[0][3:], (3 * anchors, 1))
+        print(np.tile(bboxes[0][2:], (3 * anchors, 1)))
+        return np.tile(bboxes[0][2:], (3 * anchors, 1))
 
     dimensions_count = anchors * len(backprop_layer_indices)
-    dimensions = bboxes[..., 3:5]
+    dimensions = bboxes[..., 2:4]
 
     kmeans = KMeans(n_clusters=dimensions_count)
     kmeans.fit(dimensions)
@@ -457,7 +475,7 @@ def conv(depth, kernel_shape, stride=1, padding="SAME"):
     return [
         Conv2d(depth=depth, kernel_shape=kernel_shape, stride=stride, padding=padding),
         BatchNorm(),
-        Activation(activation_function)
+        activation_function(*params)
     ]
 
 def res_block(filters, extra_layers=[]):
@@ -475,10 +493,10 @@ def long_res_block(filters, repeats):
     return block
 
 if __name__ == "__main__":
-    training_percent = 1700/1800
-    batch_size = 16
+    training_percent = 1600/1800
+    batch_size = 32
 
-    image_width, image_height = [352, 352]
+    image_width, image_height = [320, 320]
     backprop_layer_indices = [-1, -4, -7]
     
     grid_size = int(image_width / 32)
@@ -488,30 +506,25 @@ if __name__ == "__main__":
     objects = 4
 
     dropout_rate = 0
-    activation_function = Mish()
+    
+    activation_function = LRelu
+    params = []
+
     variance = "He"
-    dtype = np.float32
+    dtype = np.float16
 
     save_file = 'model-training-data.json'
-    repeats = 2
-
     dataset_size = len(os.listdir('gameplay'))
     choices = np.random.choice(dataset_size, size=int(dataset_size * training_percent), replace=False)
 
     with open('training-files.json', 'w+') as file:
         file.write(json.dumps(choices.tolist()))
     
-    bboxes, images = get_bboxes(choices)
+    bboxes = get_bboxes(choices)
     anchor_dimensions = get_anchor_data(grid_size, bboxes)
+    del bboxes
 
-    del bboxes, images
-
-    generator = Generate(batch_size, anchor_dimensions, choices)
-
-    iou_ignore_threshold = 0.5
-
-    # xdata, ydata = preprocess_data(grid_size, bboxes, images)
-    dataset_size = generator.dataset_size / repeats
+    median_dimension = np.mean(anchor_dimensions[anchor_dimensions.shape[0] // 2])
 
     print(anchor_dimensions)
 
@@ -520,6 +533,9 @@ if __name__ == "__main__":
 
     concat_start1, residual_start1, concat_end1 = first_concat.generate_layers()
     concat_start2, residual_start2, concat_end2 = second_concat.generate_layers()
+
+    weight_initializer = YoloSplit(presence_initializer=HeNormal(), dimensions_initializer=LecunNormal())
+    bias_initializer = YoloSplit(presence_initializer=Fill(-1), dimensions_initializer=Fill(np.log(0.1)))
 
     model = [
         Input((image_height, image_width, 3)),
@@ -554,33 +570,32 @@ if __name__ == "__main__":
         concat_end1,
     ]
 
-    median_dimension = np.mean(anchor_dimensions[anchor_dimensions.shape[0] // 2])
-
-    prob = (objects / grid_count * anchors)
-
-    weight_initializer = YoloSplit(presence_initializer=HeNormal(), dimensions_initializer=LecunNormal())
-    bias_initializer = YoloSplit(presence_initializer=Fill(-3), dimensions_initializer=Fill(cp.array(np.log(0.1))))
-
     addon_layers = [
         [
+            *conv(512, (1, 1)),
+            *conv(1024, (3, 3)),
+
             Conv2d(anchors * 5, (1, 1), padding="VALID", weight_initializer=weight_initializer, bias_initializer=bias_initializer),
-            Activation(YoloActivation()),
-            Flatten()
+            YoloActivation()
         ],
         [
+            *conv(256, (1, 1)),
+            *conv(512, (3, 3)),
+
             Conv2d(anchors * 5, (1, 1), padding="VALID", weight_initializer=weight_initializer, bias_initializer=bias_initializer),
-            Activation(YoloActivation()),
-            Flatten()
+            YoloActivation()
         ],
         [
+            *conv(128, (1, 1)),
+            *conv(256, (3, 3)),
+
             Conv2d(anchors * 5, (1, 1), padding="VALID", weight_initializer=weight_initializer, bias_initializer=bias_initializer),
-            Activation(YoloActivation()),
-            Flatten()
+            YoloActivation()
         ],
     ]
 
-    cooridnate_weight = 10
-    no_object_weight = 0.5
+    cooridnate_weight = 5
+    no_object_weight = 0.25
     object_weight = 1
 
     network = Network(
@@ -588,16 +603,16 @@ if __name__ == "__main__":
         addon_layers=addon_layers,
         backprop_layer_indices=backprop_layer_indices,
         loss_function = [
-            YoloLoss(coordinate_loss_function=CIoU, objectness_loss_function=BCE, grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
-            YoloLoss(coordinate_loss_function=CIoU, objectness_loss_function=BCE, grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
-            YoloLoss(coordinate_loss_function=CIoU, objectness_loss_function=BCE, grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(coordinate_loss_function=CIoU, objectness_loss_function=BCE(), grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(coordinate_loss_function=CIoU, objectness_loss_function=BCE(), grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(coordinate_loss_function=CIoU, objectness_loss_function=BCE(), grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
         ],
         # loss_function = YoloLoss(grid_size=grid_size, anchors=anchors, coordinate_weight=5, no_object_weight=no_object_weight, object_weight=1),
-        optimizer = Adam(momentum = 0.9, beta_constant = 0.95), 
+        optimizer = Adam(momentum = 0.85, beta_constant = 0.95, weight_decay=1e-5), 
         # optimizer = RMSProp(beta_constant = 0.9),
         # optimizer = Momentum(momentum=0.9),
-        # scheduler = StepLR(initial_learning_rate=0.00003, decay_rate=0.5, decay_interval=50 / repeats), 
-        # scheduler=CosineAnnealingDecay(initial_learning_rate=0.00003, min_learning_rate=0.00001, initial_cycle_size=50 / repeats, cycle_mult=2),
+        # scheduler = StepLR(initial_learning_rate=0.00001, decay_rate=0.5, decay_interval=75), 
+        # scheduler=CosineAnnealingDecay(initial_learning_rate=0.00003, min_learning_rate=0.00001, initial_cycle_size=50, cycle_mult=2),
         # scheduler=ExponentialDecay(initial_learning_rate=0.00007, decay_rate=0.995),
         gpu_mem_frac = 1.0, 
         dtype = dtype
@@ -618,7 +633,10 @@ if __name__ == "__main__":
     titles = ['object_loss', 'no_object_loss', 'coordinate_loss']
     colors = ['C0', 'C1', 'C2']
 
-    for idx, cost in enumerate(network.fit(generator=generator, batch_size=batch_size, learning_rate=0.0001, epochs = 200000, gradient_transformer=ClipGradient(10))):
+    generator = Generate(batch_size, anchor_dimensions, (image_width, image_height), grid_size, anchors, choices, data_augmentation=True)
+    dataset_size = generator.dataset_size
+
+    for idx, cost in enumerate(network.fit(generator=generator, batch_size=batch_size, learning_rate=0.0001, epochs = 200000)):
 
         print(cost)
 
