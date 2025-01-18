@@ -57,57 +57,51 @@ def save():
 
 if __name__ == "__main__":
     training_percent = 1
-    batch_size = 16
+    batch_size = 64
     image_width, image_height = [128, 128]
 
-    activation_function = Mish()
+    activation_function = Mish
 
     model = [
         Input((image_height, image_width, 3)),
 
         Conv2d(6, (3, 3)),
         BatchNorm(),
-        Activation(activation_function),
+        activation_function(),
         
         MaxPool((2, 2)),
 
-        ResidualBlock([
-            Conv2d(6, (3, 3), padding="SAME"),
-            BatchNorm(),
-            Activation(activation_function),
-        ]),
-
         Conv2d(12, (3, 3)),
         BatchNorm(),
-        Activation(activation_function),
+        activation_function(),
         
         MaxPool((2, 2)),
 
         Conv2d(18, (3, 3)),
         BatchNorm(),
-        Activation(activation_function),
+        activation_function(),
         
         MaxPool((2, 2)),
 
         Flatten(),
 
         Dense(256),
-        Activation(activation_function),
+        activation_function(),
         
         Dense(128),
-        Activation(activation_function),
+        activation_function(),
 
         Dense(64),
-        Activation(activation_function),
+        activation_function(),
 
         Dense(32),
-        Activation(activation_function),
+        activation_function(),
 
         Dense(8),
-        Activation(Softmax())
+        Softmax()
     ]
 
-    network = Network(model, dtype=cp.float32, loss_function=CrossEntropy(), optimizer=Adam(momentum = 0.9, beta_constant = 0.99), scheduler=StepLR(initial_learning_rate=0.00005, decay_rate=0.5, decay_interval=5))
+    network = Network(model, dtype=cp.float32, loss_function=BCE(), optimizer=Adam(momentum = 0.9, beta_constant = 0.99), scheduler=StepLR(initial_learning_rate=0.0001, decay_rate=0.5, decay_interval=5))
     network.compile()
 
     save_file = 'model-training-data.json'
@@ -126,7 +120,7 @@ if __name__ == "__main__":
     val_costs = []
     plt.ion()
 
-    for idx, cost in enumerate(network.fit(xdata, ydata, learning_rate=0.0001, batch_size = batch_size, epochs = 200, gradient_transformer=AutoClipper(10))):
+    for idx, cost in enumerate(network.fit(xdata, ydata, learning_rate=0.001, batch_size = batch_size, epochs = 200)):
         print(cost)
 
         threading.Thread(target=save).start()
