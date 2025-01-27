@@ -1,7 +1,6 @@
 import cupy as cp, utils.layers, time, math, os
 from datetime import datetime
 from utils.optimizers import *
-from utils.activations import *
 from utils.loss import *
 from utils.functions import Processing
 
@@ -32,7 +31,8 @@ class Network:
         if physical_gpus:
             device = cp.cuda.Device(0)  # Assuming GPU index 0
             total_memory = device.mem_info[1]
-            total_memory = total_memory // (1024 ** 2)
+            print(total_memory)
+            total_memory = total_memory // (1000 ** 2)
 
             
             try:
@@ -141,29 +141,30 @@ class Network:
         self.scheduler = scheduler
         self.dtype = dtype
 
-        model = []
+        with tf.device('/GPU:1'):
+            model = []
 
-        for layer_args, layer_data, layer_type in model_data:
-            layer_class = getattr(utils.layers, layer_type)
-            layer = layer_class(*layer_args)
-
-            layer.load(layer_data, self.dtype)
-
-            model.append(layer)
-
-        addon_layers = []
-
-        for addon_data in combined_addon_data:
-            layers = []
-            for layer_args, layer_data, layer_type in addon_data:
+            for layer_args, layer_data, layer_type in model_data:
                 layer_class = getattr(utils.layers, layer_type)
                 layer = layer_class(*layer_args)
 
                 layer.load(layer_data, self.dtype)
 
-                layers.append(layer)
+                model.append(layer)
 
-            addon_layers.append(layers)
+            addon_layers = []
+
+            for addon_data in combined_addon_data:
+                layers = []
+                for layer_args, layer_data, layer_type in addon_data:
+                    layer_class = getattr(utils.layers, layer_type)
+                    layer = layer_class(*layer_args)
+
+                    layer.load(layer_data, self.dtype)
+
+                    layers.append(layer)
+
+                addon_layers.append(layers)
 
         self.model = model
         self.addon_layers = addon_layers
@@ -180,7 +181,7 @@ class Network:
                 negative_index = idx - len(self.model)
 
                 if (idx in self.backprop_layer_indices) or (negative_index in self.backprop_layer_indices):
-                    _activations = tf.identity(activations)
+                    _activations = activations
 
                     if self.addon_layers:
                         if idx in self.backprop_layer_indices:
@@ -201,8 +202,8 @@ class Network:
         costs = []
         node_values = []
 
-        outputs = tf.constant(outputs, dtype=self.dtype)
-        expected_outputs = tf.constant(expected_outputs, dtype=self.dtype)
+        outputs = tf.convert_to_tensor(outputs, dtype=self.dtype)
+        expected_outputs = tf.convert_to_tensor(expected_outputs, dtype=self.dtype)
 
         with tf.GradientTape() as tape:
             tape.watch(outputs)
@@ -240,7 +241,7 @@ class Network:
 
                     output = outputs[addon_index]
 
-                    indexed_expected_outputs = tf.constant([
+                    indexed_expected_outputs = tf.convert_to_tensor([
                         expected_output[addon_index] for expected_output in expected_outputs
                     ], dtype=self.dtype)
 
@@ -285,7 +286,7 @@ class Network:
 
         for gradient in gradients:
             for idx, layer in enumerate(gradient):
-                if not isinstance(layer, (list, tuple, None)):
+                if not isinstance(layer, [list, tuple, None]):
                     summed_array[idx] += layer
                 else:
                     summed_array[idx] = self._sum_gradients([gradient[idx] for gradient in gradients])
@@ -294,7 +295,7 @@ class Network:
 
     def _scale_gradient(self, gradient, scale):
         for idx, layer in enumerate(gradient):
-            if not isinstance(layer, (list, tuple, None)):
+            if not isinstance(layer, [list, tuple, None]):
                 if len(layer) == 0:
                     continue
                 gradient[idx] /= scale
@@ -305,7 +306,7 @@ class Network:
 
     def _numpify_values(self, values):
         for idx, layer in enumerate(values):
-            if not isinstance(layer, (list, tuple, None)):
+            if not isinstance(layer, [list, tuple, None]):
                 if len(layer) == 0:
                     values[idx] = np.array([])
                 values[idx] = layer.numpy()
@@ -317,7 +318,7 @@ class Network:
         return values
 
     def _cupify_values(self, values):
-        values = tf.identity(values)
+        values = values[:]
         for idx, layer in enumerate(values):
             if isinstance(layer, np.ndarray):
                 if layer.size == 0:
@@ -382,11 +383,10 @@ class Network:
 
             del selected_xdata, selected_ydata
 
-            if gradient_transformer:
-                for transformer in gradient_transformer:
-                    gradient, addon_gradients = transformer.forward([gradient, addon_gradients])
-
             with tf.device('/GPU:1'):
+                if gradient_transformer:
+                    for transformer in gradient_transformer:
+                        gradient, addon_gradients = transformer.forward([gradient, addon_gradients])
 
                 for addon_index, (addon_layers, addon_gradient, addon_optimizer_value) in enumerate(zip(self.addon_layers, addon_gradients, addon_optimizer_values)):
                     for idx, (layer, layer_gradient, descent_values) in enumerate(zip(addon_layers, addon_gradient, addon_optimizer_value)):

@@ -39,7 +39,7 @@ class Input(Layer):
         self.output_shape = np.array(input_shape)
 
     def forward(self, input_activations, training=True):
-        output_activations = tf.constant(input_activations, dtype=self.dtype)
+        output_activations = tf.cast(input_activations, dtype=self.dtype)
 
         return output_activations
 
@@ -183,7 +183,7 @@ class Conv2d(Layer):
 
         if initialize_weights:
             self.kernels = tf.cast(self.weight_initializer(fan_in, fan_out, (kernel_height, kernel_width, input_channels, output_channels)), dtype=dtype)
-            self.biases = tf.cast(self.bias_initializer(fan_in, fan_out, output_shape), dtype=dtype)
+            self.biases = tf.cast(self.bias_initializer(fan_in, fan_out, (output_channels,)), dtype=dtype)
 
     def update(self, optimizer, gradient, descent_values, learning_rate, iteration):
         if not descent_values is None:
@@ -207,6 +207,26 @@ class Conv2d(Layer):
         self.kernels, self.biases = data
         self.kernels = tf.constant(self.kernels, dtype=dtype)
         self.biases = tf.constant(self.biases, dtype=dtype)
+
+class Activation(Layer):
+    def __init__(self, activation_function):
+        self.activation_function = activation_function
+
+    def forward(self, input_activations, training=True):
+        output_activations = self.activation_function.forward(input_activations)
+
+        if training:
+            self.input_activations = input_activations
+
+        return output_activations
+
+    def backward(self, node_values):
+        new_node_values = node_values * self.activation_function.backward(self.input_activations)
+        del self.input_activations
+        return new_node_values, []
+
+    def save(self):
+        return [self.activation_function], None
 
 class Dense(Layer):
     def __init__(self, depth, weight_initializer=HeNormal(), bias_initializer=Fill(0)):
@@ -273,7 +293,7 @@ class Dense(Layer):
         return [self.depth, self.weight_initializer, self.bias_initializer], self.layer.numpy()
 
     def load(self, data, dtype):
-        self.layer = tf.constant(data, dtype=dtype)
+        self.layer = tf.convert_to_tensor(data, dtype=dtype)
 
 class ConcatBlock(Layer):
     def __init__(self, layers, residual_layers, axis=-1):
@@ -420,7 +440,8 @@ class ResidualBlock(Layer):
             raise AttributeError("Layer needs to be initialized first.")
         
         return sum([layer.size for layer in self.layers])
-
+    
+    # TODO: Vectorize with tf
     def forward(self, input_activations, training=True):
         activations = input_activations
 
@@ -433,17 +454,17 @@ class ResidualBlock(Layer):
 
     def backward(self, output_gradient):
         gradients = [None] * len(self.layers)
-        _output_gradient = output_gradient
+        _input_gradient = output_gradient
 
         for idx, layer in enumerate(self.layers[::-1]):
             current_layer_index = -(idx + 1)
             
-            _output_gradient, gradient = layer.backward(_output_gradient)
+            _input_gradient, gradient = layer.backward(_input_gradient)
             gradients[current_layer_index] = gradient
 
             del gradient
 
-        return _output_gradient + output_gradient, [gradients]
+        return _input_gradient + output_gradient, gradients
 
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         output_shape = input_shape.copy()
@@ -451,18 +472,18 @@ class ResidualBlock(Layer):
         for layer in self.layers:
             layer.initialize(output_shape, initialize_weights=initialize_weights, dtype=dtype)
             output_shape = layer.output_shape
-            print(layer, output_shape, "MAIN")
 
         self.output_shape = output_shape
 
     def update(self, optimizer, gradients, descent_values, learning_rate, iteration):
         new_descent_values = []
         if descent_values is None:
-            descent_values = []
+            descent_values = [None] * len(self.layers)
 
         for layer, layer_gradient, descent_value in zip(self.layers, gradients, descent_values):
             new_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate, iteration)
             new_descent_values.append(new_descent_value)
+            del new_descent_value
 
         return new_descent_values
 
@@ -596,33 +617,26 @@ class BatchNorm(Layer):
         return self._size_of(self.gamma) + self._size_of(self.beta) + self._size_of(self.running_mean) + self._size_of(self.running_var)
 
     def forward(self, input_activations, training=True):
-        axes = np.arange(input_activations.ndim - 1)
+        axes = tf.range(tf.rank(input_activations) - 1)
 
         if training:
-            batch_mean = tf.reduce_mean(input_activations, axis=axes, keepdims=True)
-            batch_var = tf.math.reduce_variance(input_activations, axis=axes, keepdims=True)
+            self.batch_mean = tf.reduce_mean(input_activations, axis=axes, keepdims=True)
+            self.batch_var = tf.math.reduce_variance(input_activations, axis=axes, keepdims=True)
 
-            x_centered = input_activations - batch_mean
-
-            stddev_inv = 1 / tf.sqrt(batch_var + self.epsilon)
-            x_norm = x_centered * stddev_inv
-
-            self.batch_mean = batch_mean
-            self.batch_var = batch_var
+            x_norm = (input_activations - self.batch_mean) / tf.sqrt(self.batch_var + self.epsilon)
+                    
         else:
-            x_norm = (input_activations - self.running_mean) / (tf.sqrt(self.running_var) + self.epsilon)
-        
+            x_norm = (input_activations - self.running_mean) / (tf.sqrt(self.running_var + self.epsilon))
+
         output_activations = self.gamma * x_norm + self.beta
 
         if training:
             self.input_activations = input_activations
-            self.batch_mean = batch_mean
-            self.batch_var = batch_var
 
         return output_activations
 
     def backward(self, output_gradient):
-        axes = np.arange(self.input_activations.ndim - 1)
+        axes = tf.range(tf.rank(self.input_activations) - 1)
         stddev_inv = 1 / tf.sqrt(self.batch_var + self.epsilon)
         x_centered = self.input_activations - self.batch_mean
         x_norm = x_centered * stddev_inv
@@ -669,10 +683,10 @@ class BatchNorm(Layer):
             features = input_shape
 
         if initialize_weights:
-            self.gamma = tf.ones((1,) * dims + (features,), dtype=dtype)
-            self.beta = tf.zeros((1,) * dims + (features,), dtype=dtype)
-            self.running_mean = tf.zeros((1,) * dims + (features,), dtype=dtype)
-            self.running_var = tf.ones((1,) * dims + (features,), dtype=dtype)
+            self.gamma = tf.ones((features,), dtype=dtype)
+            self.beta = tf.zeros((features,), dtype=dtype)
+            self.running_mean = tf.zeros((features,), dtype=dtype)
+            self.running_var = tf.ones((features,), dtype=dtype)
 
         self.output_shape = input_shape
 
@@ -842,7 +856,7 @@ class Dropout(Layer):
         
     def forward(self, input_activations, training=True):
         if training:
-            self.mask = ((cp.random.rand(*input_activations.shape) > self.dropout_rate) / ( 1 - self.dropout_rate)).astype(self.dtype)
+            self.mask = ((tf.random.uniform(*input_activations.shape) > self.dropout_rate) / ( 1 - self.dropout_rate)).astype(self.dtype)
         else:
             return input_activations
 

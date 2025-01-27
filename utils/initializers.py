@@ -48,24 +48,26 @@ class Fill:
         return tf.fill(shape, self.value)
 
 class YoloSplit:
-    def __init__(self, presence_initializer=HeNormal(), dimensions_initializer=HeNormal()):
+    def __init__(self, presence_initializer=HeNormal(), xy_initializer=HeNormal(), dimensions_initializer=HeNormal()):
         self.presence_initializer = presence_initializer
+        self.xy_initializer = xy_initializer
         self.dimensions_initializer = dimensions_initializer
 
     def __call__(self, fan_in, fan_out, shape):
         anchors = shape[-1] // 5
 
-        dimensions_shape = list(shape)
-        dimensions_shape[-1] -= anchors
-        dimensions_shape = dimensions_shape[:-1] + [anchors, dimensions_shape[-1] // 3]
-
         presence_shape = list(shape)
         presence_shape[-1] //= 5
         presence_shape = presence_shape[:-1] + [anchors, 1]
 
+        dimensions_shape = list(shape)
+        dimensions_shape[-1] = int((dimensions_shape[-1] - anchors) / 2)
+        dimensions_shape = dimensions_shape[:-1] + [anchors, dimensions_shape[-1] // anchors]
+
+        xy_data = tf.cast(self.xy_initializer(fan_in, fan_out, dimensions_shape), tf.float64)
         dimensions_data = tf.cast(self.dimensions_initializer(fan_in, fan_out, dimensions_shape), tf.float64)
         presence_data = tf.cast(self.presence_initializer(fan_in, fan_out, presence_shape), tf.float64) # Every 5th output will correspond with a presence score
 
-        data = tf.concat((presence_data, dimensions_data), axis=-1)
+        data = tf.concat((presence_data, xy_data, dimensions_data), axis=-1)
 
         return tf.reshape(data, shape)

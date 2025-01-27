@@ -1,7 +1,6 @@
 from utils.layers import *
 from utils.network import Network
 from utils.optimizers import Adam
-from utils.activations import *
 from utils.loss import *
 from PIL import Image
 from tqdm import tqdm

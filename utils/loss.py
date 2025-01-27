@@ -10,7 +10,7 @@ class CrossEntropy:
         self.epsilon = epsilon
 
     def forward(self, outputs, target_outputs):
-        outputs += epsilon
+        outputs = tf.clip_by_value(outputs, self.epsilon, 1.0)
         per_sample_loss = -tf.reduce_sum(target_outputs * tf.math.log(outputs), axis=1)
         return tf.reduce_mean(per_sample_loss)
 
@@ -26,14 +26,15 @@ class MSE:
         return tf.reduce_mean((outputs - target_outputs) ** 2, axis=axis)
 
 class BCE:
-    def __init__(self, epsilon=1e-12):
-        self.epsilon = epsilon
+    def __init__(self):
+        pass
 
-    def forward(self, outputs, target_outputs):
+    @staticmethod
+    def forward(outputs, target_outputs):
         if outputs.shape[0] == 0:
             return 0
 
-        outputs += self.epsilon  # To prevent log(0)
+        outputs = tf.clip_by_value(outputs, 1e-6, 1 - 1e-6)  # To prevent log(0)
 
         return -tf.reduce_mean(
             target_outputs * tf.math.log(outputs) + (1 - target_outputs) * tf.math.log(1 - outputs)
@@ -70,8 +71,8 @@ class CIoU:
         inter_wh = tf.maximum(inter_bottom_right - inter_top_left, 0.0)
         inter_area = inter_wh[..., 0] * inter_wh[..., 1]
 
-        outputs_area = outputs_wh[..., 0] * outputs_wh[..., 1]
-        target_outputs_area = target_outputs_wh[..., 0] * target_outputs_wh[..., 1]
+        outputs_area = (outputs_bottom_right[..., 0] - outputs_top_left[..., 0]) * (outputs_bottom_right[..., 1] - outputs_top_left[..., 1])
+        target_outputs_area = (target_outputs_bottom_right[..., 0] - target_outputs_top_left[..., 0]) * (target_outputs_bottom_right[..., 1] - target_outputs_top_left[..., 1])
         union_area = outputs_area + target_outputs_area - inter_area
 
         iou = inter_area / (union_area + 1e-6)
@@ -112,30 +113,21 @@ class DIoU:
         target_outputs_top_left = target_outputs[..., :2] - target_outputs_wh / 2
         target_outputs_bottom_right = target_outputs[..., :2] + target_outputs_wh / 2
 
-        # Intersection area calculation
         inter_top_left = tf.maximum(outputs_top_left, target_outputs_top_left)
         inter_bottom_right = tf.minimum(outputs_bottom_right, target_outputs_bottom_right)
         inter_wh = tf.maximum(inter_bottom_right - inter_top_left, 0.0)
         inter_area = inter_wh[..., 0] * inter_wh[..., 1]
 
-        # Area of the individual boxes
-        outputs_area = (outputs_bottom_right[..., 0] - outputs_top_left[..., 0]) * \
-                    (outputs_bottom_right[..., 1] - outputs_top_left[..., 1])
-        target_outputs_area = (target_outputs_bottom_right[..., 0] - target_outputs_top_left[..., 0]) * \
-                                (target_outputs_bottom_right[..., 1] - target_outputs_top_left[..., 1])
-
-        # Union area
+        outputs_area = (outputs_bottom_right[..., 0] - outputs_top_left[..., 0]) * (outputs_bottom_right[..., 1] - outputs_top_left[..., 1])
+        target_outputs_area = (target_outputs_bottom_right[..., 0] - target_outputs_top_left[..., 0]) * (target_outputs_bottom_right[..., 1] - target_outputs_top_left[..., 1])
         union_area = outputs_area + target_outputs_area - inter_area
 
-        # IoU calculation
         iou = inter_area / (union_area + 1e-6)
 
-        # Center distance calculation (make sure to square the differences)
         outputs_center = outputs[..., :2]
         target_outputs_center = target_outputs[..., :2]
         center_distance = tf.reduce_sum(tf.square(outputs_center - target_outputs_center), axis=1)
 
-        # Enclosing box diagonal calculation (correct the diagonal formula)
         enclosing_top_left = tf.minimum(outputs_top_left, target_outputs_top_left)
         enclosing_bottom_right = tf.maximum(outputs_bottom_right, target_outputs_bottom_right)
         enclosing_wh = enclosing_bottom_right - enclosing_top_left
@@ -154,8 +146,8 @@ class YoloLoss:
         self.objectness_loss_function = objectness_loss_function
         self.coordinate_loss_function = coordinate_loss_function
 
-        self.grid_size = grid_size
         self.anchor_dimensions = tf.constant(anchor_dimensions, dtype=dtype)
+        self.grid_size = tf.constant(grid_size, dtype=dtype)
 
         self.contraction_decay_rate = tf.constant(contraction_decay_rate, dtype=dtype)
         self.contraction_weight = tf.constant(contraction_weight, dtype=dtype)
@@ -174,13 +166,13 @@ class YoloLoss:
         coordinate_weight = tf.constant(self.coordinate_weight, dtype=dtype)
         no_object_weight = tf.constant(self.no_object_weight, dtype=dtype)
         object_weight = tf.constant(self.object_weight, dtype=dtype)
-        anchors = self.anchors
+        anchors = tf.constant(self.anchors, dtype=dtype)
 
         batch_size = outputs.shape[0]
-        grid_size = tf.sqrt(tf.reduce_prod(outputs.shape[1:]) / (anchors * 5))
+        grid_size = tf.sqrt(tf.reduce_prod(tf.cast(outputs.shape[1:], dtype)) / (anchors * 5))
         grid_size = tf.floor(grid_size)
 
-        scale_idx = tf.math.log(grid_size / self.grid_size) / tf.math.log(tf.constant(2.0, dtype=tf.float64))
+        scale_idx = tf.math.log(grid_size / self.grid_size) / tf.math.log(tf.constant(2.0, dtype=dtype))
 
         # Shape: (anchors, 2)
         scale_anchor_wh = tf.convert_to_tensor(
@@ -233,7 +225,7 @@ class YoloLoss:
             tf.boolean_mask(inactive_target_boxes, inactive_mask), 
         )
 
-        ious = tf.stop_gradient(tf.linalg.diag_part(Processing.iou(active_boxes, active_target_boxes, api=tf)))
+        ious = 1 - tf.stop_gradient(self.coordinate_loss_function.forward(active_boxes, active_target_boxes)) / 2
 
         # Compute losses
         coordinate_loss = tf.reduce_mean(self.coordinate_loss_function.forward(active_boxes, active_target_boxes)) * coordinate_weight

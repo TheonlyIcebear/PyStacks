@@ -85,11 +85,10 @@ class Generate:
                             ] for line in lines
                         ], dtype=np.float64)
 
-                    objects_present = location_data.shape[0]
 
                 else:
                     print("[LOG] Empty image detected")
-                    continue
+                    location_data = np.array([])
 
                 location_data += 10e-8
 
@@ -256,7 +255,7 @@ def parse_output(outputs, grid_size, anchor_dimensions):
 def get_bboxes(choices):
     bboxes = np.empty((0, 4))
 
-    augmenter = A.Compose([
+    augmentor = A.Compose([
         A.HorizontalFlip(p=0.5),
         A.HueSaturationValue(hue_shift_limit=(-5.0, 5.0), sat_shift_limit=(-5.0, 5.0), val_shift_limit=(-5.0, 5.0), p=0.5),
 
@@ -295,7 +294,6 @@ def get_bboxes(choices):
                 ], dtype=np.float64)
 
             location_data = location_data[:objects]
-            objects_present = location_data.shape[0]
 
         else:
             print("[LOG] Empty image detected")
@@ -318,7 +316,7 @@ def get_bboxes(choices):
 
             classes = ['enemy'] * len(location_data)
 
-            augmented_result = augmenter(image=root_image, bboxes=location_data, class_labels=classes)
+            augmented_result = augmentor(image=root_image, bboxes=location_data, class_labels=classes)
             image = augmented_result['image']
             _bboxes = np.array(augmented_result['bboxes'])
 
@@ -337,7 +335,7 @@ def get_anchor_data(grid_size, bboxes):
         print(np.tile(bboxes[0][2:], (3 * anchors, 1)))
         return np.tile(bboxes[0][2:], (3 * anchors, 1))
 
-    dimensions_count = anchors * len(backprop_layer_indices)
+    dimensions_count = anchors * yolo_head_count
     dimensions = bboxes[..., 2:4]
 
     kmeans = KMeans(n_clusters=dimensions_count)
@@ -408,7 +406,7 @@ def preprocess_data(grid_size, bboxes, images):
     anchors_count = np.zeros(anchor_dimensions.shape[0])
 
     xdata = images
-    expected_outputs = lambda: [np.zeros((grid_size * 2 ** i, grid_size * 2 ** i, anchors, 5)) for i in range(len(backprop_layer_indices))]
+    expected_outputs = lambda: [np.zeros((grid_size * 2 ** i, grid_size * 2 ** i, anchors, 5)) for i in range(yolo_head_count)]
     ydata = [expected_outputs() for _ in range(int(bboxes[-1][0] + 1))]
 
     for (idx, true_center_x, true_center_y, width, height) in tqdm(bboxes):
@@ -475,29 +473,28 @@ def conv(depth, kernel_shape, stride=1, padding="SAME"):
     return [
         Conv2d(depth=depth, kernel_shape=kernel_shape, stride=stride, padding=padding),
         BatchNorm(),
-        activation_function(*params)
+        Activation(activation_function)
     ]
 
 def res_block(filters, extra_layers=[]):
     return ResidualBlock([
         *conv(filters, (1, 1)),
-        *conv(filters * 2, (3, 3)),
-        *extra_layers
+        *conv(filters * 2, (3, 3))
     ])
 
 def long_res_block(filters, repeats):
-    block = res_block(filters)
-    for _ in range(repeats - 1):
-        block = res_block(filters, [block])
+    block = []
+    for _ in range(repeats):
+        block.append(res_block(filters))
 
     return block
 
 if __name__ == "__main__":
-    training_percent = 1600/1800
-    batch_size = 32
+    training_percent = 1700/1839
+    batch_size = 16
 
-    image_width, image_height = [320, 320]
-    backprop_layer_indices = [-1, -4, -7]
+    image_width, image_height = [416, 416]
+    yolo_head_count = 3
     
     grid_size = int(image_width / 32)
     grid_count = grid_size ** 2
@@ -506,12 +503,9 @@ if __name__ == "__main__":
     objects = 4
 
     dropout_rate = 0
-    
-    activation_function = LRelu
-    params = []
-
+    activation_function = Mish()
     variance = "He"
-    dtype = np.float16
+    dtype = np.float32
 
     save_file = 'model-training-data.json'
     dataset_size = len(os.listdir('gameplay'))
@@ -534,8 +528,8 @@ if __name__ == "__main__":
     concat_start1, residual_start1, concat_end1 = first_concat.generate_layers()
     concat_start2, residual_start2, concat_end2 = second_concat.generate_layers()
 
-    weight_initializer = YoloSplit(presence_initializer=HeNormal(), dimensions_initializer=LecunNormal())
-    bias_initializer = YoloSplit(presence_initializer=Fill(-1), dimensions_initializer=Fill(np.log(0.1)))
+    weight_initializer = YoloSplit(presence_initializer=HeNormal(), xy_initializer=HeNormal(), dimensions_initializer=LecunNormal())
+    bias_initializer = YoloSplit(presence_initializer=Fill(-5), xy_initializer=Fill(0), dimensions_initializer=Fill(np.log(0.1)))
 
     model = [
         Input((image_height, image_width, 3)),
@@ -545,57 +539,78 @@ if __name__ == "__main__":
         res_block(32),
 
         *conv(128, (3, 3), stride=2, padding="SAME"),
-        long_res_block(64, 2),
+        *long_res_block(64, 2),
 
         *conv(256, (3, 3), stride=2, padding="SAME"), 
-        long_res_block(128, 8),
+        *long_res_block(128, 8),
         
         concat_start1,
             *conv(512, (3, 3), stride=2, padding="SAME"), 
-            long_res_block(256, 8),
+            *long_res_block(256, 8),
             
             concat_start2,
                 *conv(1024, (3, 3), stride=2, padding="SAME"), 
+                
+                *long_res_block(512, 4),
+
+                *conv(512, (1, 1)),
+                *conv(1024, (3, 3)),
                 # ROUTE: 1
-                long_res_block(512, 4),
+
                 Upsample(2),
 
             residual_start2,
-            # ROUTE: 2
             concat_end2,
+
+            *conv(256, (1, 1)),
+            *conv(512, (3, 3)),
+            # ROUTE: 2
+
             Upsample(2),
 
         residual_start1,
-        # ROUTE: 3
         concat_end1,
+
+        *conv(128, (1, 1)),
+        *conv(256, (3, 3)),
+
+        # ROUTE: 3
     ]
+
+    backprop_layer_indices = [-1, -10, -19]
 
     addon_layers = [
         [
+            
+
             *conv(512, (1, 1)),
             *conv(1024, (3, 3)),
+            *conv(512, (1, 1)),
 
             Conv2d(anchors * 5, (1, 1), padding="VALID", weight_initializer=weight_initializer, bias_initializer=bias_initializer),
-            YoloActivation()
+            Activation(YoloActivation())
         ],
         [
+            
             *conv(256, (1, 1)),
             *conv(512, (3, 3)),
+            *conv(256, (1, 1)),
 
             Conv2d(anchors * 5, (1, 1), padding="VALID", weight_initializer=weight_initializer, bias_initializer=bias_initializer),
-            YoloActivation()
+            Activation(YoloActivation())
         ],
         [
             *conv(128, (1, 1)),
             *conv(256, (3, 3)),
+            *conv(128, (1, 1)),
 
             Conv2d(anchors * 5, (1, 1), padding="VALID", weight_initializer=weight_initializer, bias_initializer=bias_initializer),
-            YoloActivation()
+            Activation(YoloActivation())
         ],
     ]
 
-    cooridnate_weight = 5
-    no_object_weight = 0.25
+    cooridnate_weight = 10
+    no_object_weight = 10
     object_weight = 1
 
     network = Network(
@@ -603,15 +618,15 @@ if __name__ == "__main__":
         addon_layers=addon_layers,
         backprop_layer_indices=backprop_layer_indices,
         loss_function = [
-            YoloLoss(coordinate_loss_function=CIoU, objectness_loss_function=BCE(), grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
-            YoloLoss(coordinate_loss_function=CIoU, objectness_loss_function=BCE(), grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
-            YoloLoss(coordinate_loss_function=CIoU, objectness_loss_function=BCE(), grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(coordinate_loss_function=DIoU, objectness_loss_function=BCE, grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(coordinate_loss_function=DIoU, objectness_loss_function=BCE, grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(coordinate_loss_function=DIoU, objectness_loss_function=BCE, grid_size=grid_size, anchors=anchors, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
         ],
         # loss_function = YoloLoss(grid_size=grid_size, anchors=anchors, coordinate_weight=5, no_object_weight=no_object_weight, object_weight=1),
-        optimizer = Adam(momentum = 0.85, beta_constant = 0.95, weight_decay=1e-5), 
+        optimizer = Adam(momentum = 0.8, beta_constant = 0.9, weight_decay=1e-7), 
         # optimizer = RMSProp(beta_constant = 0.9),
         # optimizer = Momentum(momentum=0.9),
-        # scheduler = StepLR(initial_learning_rate=0.00001, decay_rate=0.5, decay_interval=75), 
+        scheduler = StepLR(initial_learning_rate=0.0003, decay_rate=0.5, decay_interval=100), 
         # scheduler=CosineAnnealingDecay(initial_learning_rate=0.00003, min_learning_rate=0.00001, initial_cycle_size=50, cycle_mult=2),
         # scheduler=ExponentialDecay(initial_learning_rate=0.00007, decay_rate=0.995),
         gpu_mem_frac = 1.0, 
@@ -636,7 +651,7 @@ if __name__ == "__main__":
     generator = Generate(batch_size, anchor_dimensions, (image_width, image_height), grid_size, anchors, choices, data_augmentation=True)
     dataset_size = generator.dataset_size
 
-    for idx, cost in enumerate(network.fit(generator=generator, batch_size=batch_size, learning_rate=0.0001, epochs = 200000)):
+    for idx, cost in enumerate(network.fit(generator=generator, batch_size=batch_size, learning_rate=0.0001, epochs = 20000000)):
 
         print(cost)
 
@@ -645,9 +660,9 @@ if __name__ == "__main__":
 
         try:
             if not idx % 5:
-                for i in range(len(backprop_layer_indices)):
+                for i in range(yolo_head_count):
                     for j in range(3):
-                        plt.subplot(3, len(backprop_layer_indices), (i * 3) + j + 1)
+                        plt.subplot(3, yolo_head_count, (i * 3) + j + 1)
 
                         plt.plot(np.arange(idx + starting_idx + 1) * (batch_size / dataset_size), np.array(costs)[:, i, j], colors[j], label=titles[j])
 
