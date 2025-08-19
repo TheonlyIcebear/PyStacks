@@ -132,21 +132,22 @@ class Softmax:
         return y * (1 - y)
 
 class YoloActivation:
-    def __init__(self):
-        pass
+    def __init__(self, classes, dtype=np.float32):
+        self.classes = tf.constant(classes, dtype=dtype)
+        self.dtype = dtype
 
-    @staticmethod
-    def forward(x):
-        x_reshaped = tf.reshape(x, (-1, 5))
+    def forward(self, x):
+        x_reshaped = tf.reshape(x, (-1, 5+self.classes))
         return tf.reshape(tf.concat((
             Sigmoid.forward(x_reshaped[..., :3]),
-            x_reshaped[..., 3:]
+            Sigmoid.forward(x_reshaped[..., 3:5]),
+            Softmax.forward(x_reshaped[..., 5:])
         ), axis=-1), x.shape)
 
-    @staticmethod
-    def backward(x):
-        x_reshaped = tf.reshape(x, (-1, 5))
+    def backward(self, x):
+        x_reshaped = tf.reshape(x, (-1, 5+self.classes))
         return tf.reshape(tf.concat((
             Sigmoid.backward(x_reshaped[..., :3]),
-            tf.ones((x_reshaped.shape[0], 2))
+            Sigmoid.backward(x_reshaped[..., 3:5]),
+            Softmax.backward(x_reshaped[..., 5:])
         ), axis=-1), x.shape)

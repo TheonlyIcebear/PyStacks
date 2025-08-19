@@ -12,7 +12,6 @@ class Processing:
         boxes2_top_left = (boxes2[..., :2] - (boxes2[..., 2:] / 2))
         boxes2_bottom_right = (boxes2[..., :2] + (boxes2[..., 2:] / 2))
 
-
         top_left_x = api.maximum(boxes1_top_left[..., 0:1], boxes2_top_left[..., 0])  # Broadcasting along batch size
         top_left_y = api.maximum(boxes1_top_left[..., 1:2], boxes2_top_left[..., 1])
 

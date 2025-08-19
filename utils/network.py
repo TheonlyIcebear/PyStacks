@@ -1,4 +1,4 @@
-import cupy as cp, utils.layers, time, math, os
+import utils.layers, time, math, os
 from datetime import datetime
 from utils.optimizers import *
 from utils.loss import *
@@ -6,9 +6,33 @@ from utils.functions import Processing
 
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 import tensorflow.compat.v1 as tf
+
+gpu_mem_frac = 0.99  # Fraction of GPU memory to use
+
+physical_gpus = tf.config.experimental.list_physical_devices('GPU')
+
+if physical_gpus:
+    device = cp.cuda.Device(0)  # Assuming GPU index 0
+    total_memory = device.mem_info[1] / (1024 ** 2)
+    print(total_memory)
+
+    
+    try:
+        tf.config.experimental.set_virtual_device_configuration(
+            physical_gpus[0],
+            [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=gpu_mem_frac * total_memory)]
+        )
+
+        print(f"Available Memory: {total_memory} (MB), Physical GPUs: {len(physical_gpus)}")
+
+    except RuntimeError as e:
+        print(f"Error: {e}") 
+else:
+    raise RuntimeError("Must have atleast one CUDA compatible GPU")
 
 class Network:
     def __init__(self, model=[], backprop_layer_indices=[-1], addon_layers=[], loss_function=MSE(), optimizer=SGD(), gpu_mem_frac=1, dtype=np.float64, scheduler=None):
@@ -23,38 +47,12 @@ class Network:
 
         self.learning_rate = None
         self.starting_epoch = 0
-
-        physical_gpus = tf.config.experimental.list_physical_devices('GPU')
-
-        print(physical_gpus)
-
-        if physical_gpus:
-            device = cp.cuda.Device(0)  # Assuming GPU index 0
-            total_memory = device.mem_info[1]
-            print(total_memory)
-            total_memory = total_memory // (1000 ** 2)
-
-            
-            try:
-                tf.config.experimental.set_virtual_device_configuration(
-                    physical_gpus[0],
-                    [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=1),
-                    tf.config.experimental.VirtualDeviceConfiguration(memory_limit=gpu_mem_frac * total_memory)]
-                )
-
-                # List the logical GPUs after setting up the virtual devices
-                logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-                print(f"Available Memory: {total_memory} (MiB), Physical GPUs: {len(physical_gpus)}")
-
-            except RuntimeError as e:
-                print(f"Error: {e}") 
-        else:
-            raise RuntimeError("Must have atleast one CUDA compatible GPU")
+        self.epoch = 0
 
     @property
     def size(self):
-        total_size = 128
-        for layer in self.model[1:]:
+        total_size = 0
+        for layer in self.model:
             total_size += int(layer.size)
 
         for layers in self.addon_layers:
@@ -68,7 +66,7 @@ class Network:
 
         print(input_shape)
 
-        with tf.device('/GPU:1'):
+        with tf.device('/GPU:0'):
             for idx, layer in enumerate(self.model):
                 layer.initialize(input_shape, dtype=self.dtype)
                 input_shape = layer.output_shape.copy()
@@ -109,7 +107,7 @@ class Network:
         print(f"Model Size ({label}):", size / (1024) ** unit)
 
     def save(self):
-        with tf.device('/GPU:1'):
+        with tf.device('/GPU:0'):
             model_data = []
             for layer in self.model:
                 model_data.append(list(layer.save()) + [layer.__class__.__name__])
@@ -129,7 +127,7 @@ class Network:
                 self.learning_rate, self.epoch, self.dtype
             )
 
-    def load(self, save_data):
+    def load(self, save_data, new_dtype=None):
         input_shape = None
 
         model_data, combined_addon_data, backprop_layer_indices, loss_functions, scheduler, learning_rate, starting_epoch, dtype = save_data
@@ -139,9 +137,9 @@ class Network:
         self.loss_functions = loss_functions
         self.learning_rate = learning_rate
         self.scheduler = scheduler
-        self.dtype = dtype
+        self.dtype = dtype if not new_dtype else new_dtype
 
-        with tf.device('/GPU:1'):
+        with tf.device('/GPU:0'):
             model = []
 
             for layer_args, layer_data, layer_type in model_data:
@@ -168,11 +166,12 @@ class Network:
 
         self.model = model
         self.addon_layers = addon_layers
+    
 
     def forward(self, activations, training=True):
         outputs = []
         
-        with tf.device('/GPU:1'):
+        with tf.device('/GPU:0'):
             for idx, layer in enumerate(self.model):
                 time1 = time.perf_counter()
                 activations = layer.forward(activations, training=training)
@@ -225,7 +224,7 @@ class Network:
         addon_gradients = [None] * len(self.addon_layers)
         costs = []
 
-        with tf.device('/GPU:1'):
+        with tf.device('/GPU:0'):
             for idx, layer in enumerate(self.model[::-1][:-1]):
                 current_layer_index = -(idx + 1) # - counting_offset
 
@@ -286,7 +285,7 @@ class Network:
 
         for gradient in gradients:
             for idx, layer in enumerate(gradient):
-                if not isinstance(layer, [list, tuple, None]):
+                if not isinstance(layer, (list, tuple, type(None))):
                     summed_array[idx] += layer
                 else:
                     summed_array[idx] = self._sum_gradients([gradient[idx] for gradient in gradients])
@@ -295,7 +294,7 @@ class Network:
 
     def _scale_gradient(self, gradient, scale):
         for idx, layer in enumerate(gradient):
-            if not isinstance(layer, [list, tuple, None]):
+            if not isinstance(layer, (list, tuple, type(None))):
                 if len(layer) == 0:
                     continue
                 gradient[idx] /= scale
@@ -304,34 +303,65 @@ class Network:
 
         return gradient
 
-    def _numpify_values(self, values):
-        for idx, layer in enumerate(values):
-            if not isinstance(layer, [list, tuple, None]):
-                if len(layer) == 0:
-                    values[idx] = np.array([])
-                values[idx] = layer.numpy()
-            else:
-                if layer is None:
-                    continue
-                values[idx] = self._numpify_values(layer)
+    # def _numpify_values(self, values):
+    #     for idx, layer in enumerate(values):
+    #         if not isinstance(layer, (list, tuple, type(None))):
+    #             if len(layer) == 0:
+    #                 values[idx] = np.array([])
+    #             values[idx] = layer.numpy()
+    #         else:
+    #             if layer is None:
+    #                 continue
+    #             values[idx] = self._numpify_values(layer)
 
-        return values
+    #     return values
 
-    def _cupify_values(self, values):
-        values = values[:]
-        for idx, layer in enumerate(values):
-            if isinstance(layer, np.ndarray):
-                if layer.size == 0:
-                    values[idx] = cp.array([])
-                values[idx] = cp.array(layer)
-            else:
-                if layer is None:
-                    continue
-                values[idx] = self._cupify_values(layer)
+    # def _cupify_values(self, values):
+    #     values = values[:]
+    #     for idx, layer in enumerate(values):
+    #         if isinstance(layer, np.ndarray):
+    #             if layer.size == 0:
+    #                 values[idx] = cp.array([])
+    #             values[idx] = cp.array(layer)
+    #         else:
+    #             if layer is None:
+    #                 continue
+    #             values[idx] = self._cupify_values(layer)
 
-        return values
+    #     return values
 
-    def fit(self, xdata=None, ydata=None, generator=None, batch_size=8, learning_rate=0.01, epochs=100, gradient_transformer=None):
+    def _update_weights(self, gradient, addon_gradients, optimizer_values, addon_optimizer_values, learning_rate, iteration):
+        _optimizer_values = [None] * len(self.model)
+        _addon_optimizer_values = [[None] * len(layers) for layers in self.addon_layers]
+
+        for addon_index, (addon_layers, addon_gradient, addon_optimizer_value) in enumerate(zip(self.addon_layers, addon_gradients, addon_optimizer_values)):
+            for idx, (layer, layer_gradient, descent_values) in enumerate(zip(addon_layers, addon_gradient, addon_optimizer_value)):
+
+                start_time = time.perf_counter()
+                new_descent_values = layer.update(self.optimizer, layer_gradient, descent_values, learning_rate, iteration)
+                end_time = time.perf_counter()
+
+                _addon_optimizer_values[addon_index][idx] = new_descent_values
+                del new_descent_values
+
+        if self.addon_layers:
+            del addon_gradients
+
+        for idx, (layer, layer_gradient, descent_values) in enumerate(zip(self.model[1:], gradient, optimizer_values)):
+            if layer_gradient is None:
+                continue
+
+            start_time = time.perf_counter()
+            new_descent_values = layer.update(self.optimizer, layer_gradient, descent_values, learning_rate, iteration)
+            end_time = time.perf_counter()
+
+            _optimizer_values[idx] = new_descent_values
+            del new_descent_values
+
+        return _optimizer_values, _addon_optimizer_values
+
+
+    def fit(self, xdata=None, ydata=None, generator=None, batch_size=8, learning_rate=0.01, epochs=100, accumulate=1, gradient_transformer=None):
 
         if not generator:
             xdata = np.array(xdata, dtype=self.dtype)
@@ -346,6 +376,17 @@ class Network:
         if (gradient_transformer is not None) and not isinstance(gradient_transformer, list):
             gradient_transformer = (gradient_transformer,)
 
+        if (gradient_transformer is not None):
+            for idx, transformer in enumerate(gradient_transformer):
+                print(f"Attempting to convert {transformer} to graph execution")
+                try:
+                    gradient_transformer[idx] = tf.function(transformer)
+                except Exception as e:
+                    print("Failed:", e)
+
+                else:
+                    print("Succes!")
+
         iterations = int(epochs * (dataset_size / batch_size))
 
         self.batch_size = batch_size
@@ -355,6 +396,8 @@ class Network:
 
         optimizer_values = [None] * len(self.model)
         addon_optimizer_values = [[None] * len(layers) for layers in self.addon_layers]
+        accumulated_gradient = None
+        accumulated_addon_gradient = None
 
         for iteration in range(iterations):
             start_time = time.perf_counter()
@@ -383,29 +426,35 @@ class Network:
 
             del selected_xdata, selected_ydata
 
-            with tf.device('/GPU:1'):
-                if gradient_transformer:
-                    for transformer in gradient_transformer:
-                        gradient, addon_gradients = transformer.forward([gradient, addon_gradients])
+            if not accumulated_gradient:
+                accumulated_gradient = gradient
+                accumulated_addon_gradient = addon_gradients
+            else:
+                accumulated_gradient = self._sum_gradients([accumulated_gradient, gradient])
+                accumulated_addon_gradient = self._sum_gradients([accumulated_addon_gradient, addon_gradients])
+            
+            if ((iteration + 1) % accumulate) == 0:
 
-                for addon_index, (addon_layers, addon_gradient, addon_optimizer_value) in enumerate(zip(self.addon_layers, addon_gradients, addon_optimizer_values)):
-                    for idx, (layer, layer_gradient, descent_values) in enumerate(zip(addon_layers, addon_gradient, addon_optimizer_value)):
-                        new_descent_values = layer.update(self.optimizer, layer_gradient, descent_values, learning_rate, iteration)
+                with tf.device('/GPU:0'):
+                    if gradient_transformer:
+                        for transformer in gradient_transformer:
+                            gradient, addon_gradients = transformer.forward([gradient, addon_gradients])
+                
+                start_time2 = time.perf_counter()
+                gradient = self._scale_gradient(accumulated_gradient, accumulate)
+                addon_gradients = self._scale_gradient(accumulated_addon_gradient, accumulate)
+                end_time2 = time.perf_counter()
 
-                        addon_optimizer_values[addon_index][idx] = new_descent_values
+                print(end_time2 - start_time2, "scale")
 
-                if self.addon_layers:
-                    del addon_gradient
+                start_time2 = time.perf_counter()
+                optimizer_values, addon_optimizer_values = self._update_weights(gradient, addon_gradients, optimizer_values, addon_optimizer_values, learning_rate, iteration)
+                end_time2 = time.perf_counter()
 
-                for idx, (layer, layer_gradient, descent_values) in enumerate(zip(self.model[1:], gradient, optimizer_values)):
-                    if layer_gradient is None:
-                        continue
-                    new_descent_values = layer.update(self.optimizer, layer_gradient, descent_values, learning_rate, iteration)
+                print(end_time2 - start_time2, "update")
 
-                    optimizer_values[idx] = new_descent_values
-                    del new_descent_values
-
-                del gradient
+                accumulated_gradient = None
+                accumulated_addon_gradient = None
 
             end_time = time.perf_counter()
             delay = end_time - start_time
