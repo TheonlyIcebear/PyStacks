@@ -7,7 +7,7 @@ class StepLR:
         self.decay_rate = decay_rate
         self.target = decay_interval
 
-    def forward(self, epoch):
+    def __call__(self, epoch):
         return self.initial_learning_rate * (self.decay_rate ** (epoch // self.decay_interval))
 
 class ExponentialDecay:
@@ -15,7 +15,7 @@ class ExponentialDecay:
         self.initial_learning_rate = initial_learning_rate
         self.decay_rate = decay_rate
 
-    def forward(self, epoch):
+    def __call__(self, epoch):
         return self.initial_learning_rate * (self.decay_rate ** epoch)
 
 class InverseTimeDecay:
@@ -24,7 +24,7 @@ class InverseTimeDecay:
         self.decay_interval = decay_interval
         self.decay_rate = decay_rate 
         
-    def forward(self, epoch):
+    def __call__(self, epoch):
         return self.initial_learning_rate / (1 + self.decay_rate * (epoch // self.decay_interval))
 
 class CosineAnnealingDecay:
@@ -35,7 +35,7 @@ class CosineAnnealingDecay:
         self.cycle_mult = cycle_mult
         self.current_cycle = 0
 
-    def forward(self, epoch):
+    def __call__(self, epoch):
         total_epochs_in_completed_cycles = 0
         current_cycle_epochs = self.initial_cycle_size
         

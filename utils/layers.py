@@ -23,10 +23,10 @@ class Layer:
         return input_activations
 
     def backward(self, output_gradient):
-        return output_gradient, []
+        return output_gradient, tf.constant(0, self.dtype)
 
-    def update(self, optimizer, gradient, descent_values, learning_rate, iteration):
-        pass
+    def update(self, optimizer, gradient, descent_values, learning_rate, iteration, apply=True):
+        return tf.constant(0, self.dtype)
 
     def save(self):
         return [], None
@@ -68,6 +68,7 @@ class Flatten(Layer):
 
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         self.output_shape = input_shape.prod()
+        self.dtype = dtype
 
 class Reshape(Layer):
     def __init__(self, output_shape):
@@ -80,7 +81,7 @@ class Reshape(Layer):
         return output_activations
 
     def backward(self, output_gradient):
-        return tf.reshape(output_gradient, self.input_shape), []
+        return tf.reshape(output_gradient, self.input_shape), tf.constant(0, self.dtype)
 
     def save(self):
         return [self.output_shape], None
@@ -170,10 +171,16 @@ class Conv2d(Layer):
         self.output_shape = output_shape
 
         if initialize_weights:
-            self.kernels = tf.Variable(tf.cast(self.weight_initializer(fan_in, fan_out, (kernel_height, kernel_width, input_channels, output_channels)), dtype=dtype))
-            self.biases = tf.Variable(tf.cast(self.bias_initializer(fan_in, fan_out, (output_channels,)), dtype=dtype))
+            self.kernels = tf.Variable(tf.cast(self.weight_initializer(fan_in, fan_out, (kernel_height, kernel_width, input_channels, output_channels)), dtype=dtype), trainable=True)
+            self.biases = tf.Variable(tf.cast(self.bias_initializer(fan_in, fan_out, (output_channels,)), dtype=dtype), trainable=True)
+            
+        self.dtype = dtype
 
-    def update(self, optimizer, gradient, descent_values, learning_rate, iteration):
+
+    def update(self, optimizer, gradient, descent_values, learning_rate, iteration, apply=True):
+        if not apply:
+            return [optimizer.cache_shape, optimizer.cache_shape]
+        
         if not descent_values is None:
             kernel_descent_values, bias_descent_values = descent_values
 
@@ -185,8 +192,8 @@ class Conv2d(Layer):
         kernels_gradient = tf.cast(kernels_gradient, dtype=self.kernels.dtype)
         biases_gradient = tf.cast(biases_gradient, dtype=self.biases.dtype)
 
-        self.kernels, new_kernel_descent_values = optimizer.apply_gradient(self.kernels, kernels_gradient, kernel_descent_values, learning_rate, iteration)
-        self.biases, new_bias_descent_values = optimizer.apply_gradient(self.biases, biases_gradient, bias_descent_values, learning_rate, iteration)
+        new_kernel_descent_values = optimizer.apply_gradient(self.kernels, kernels_gradient, kernel_descent_values, learning_rate, iteration)
+        new_bias_descent_values = optimizer.apply_gradient(self.biases, biases_gradient, bias_descent_values, learning_rate, iteration)
 
         return [new_kernel_descent_values, new_bias_descent_values]
 
@@ -195,8 +202,8 @@ class Conv2d(Layer):
 
     def load(self, data, dtype):
         self.kernels, self.biases = data
-        self.kernels = tf.constant(tf.cast(self.kernels, dtype=dtype), dtype=dtype)
-        self.biases = tf.constant(tf.cast(self.biases, dtype=dtype), dtype=dtype)
+        self.kernels = tf.Variable(tf.cast(self.kernels, dtype=dtype), dtype=dtype)
+        self.biases = tf.Variable(tf.cast(self.biases, dtype=dtype), dtype=dtype)
 
 class Activation(Layer):
     def __init__(self, activation_function):
@@ -213,7 +220,7 @@ class Activation(Layer):
     def backward(self, node_values):
         new_node_values = node_values * self.activation_function.backward(self.input_activations)
         del self.input_activations
-        return new_node_values, []
+        return new_node_values, tf.constant(0, node_values.dtype)
 
     def save(self):
         return [self.activation_function], None
@@ -270,12 +277,15 @@ class Dense(Layer):
             weights = tf.cast(self.weight_initializer(inputs, self.depth, (self.depth, inputs)), dtype=dtype)
             biases = tf.cast(self.bias_initializer(inputs, self.depth, (self.depth,)), dtype=dtype)
 
-            self.layer = tf.concat((weights, biases[:, None]), axis=-1)
+            self.layer = tf.Variable(tf.concat((weights, biases[:, None]), axis=-1), trainable=True)
 
         self.output_shape = self.depth
 
-    def update(self, optimizer, gradient, descent_values, learning_rate, iteration):
-        self.layer, new_descent_values = optimizer.apply_gradient(self.layer, gradient, descent_values, learning_rate, iteration)
+    def update(self, optimizer, gradient, descent_values, learning_rate, iteration, apply=True):
+        if not apply:
+            return optimizer.cache_shape
+        
+        new_descent_values = optimizer.apply_gradient(self.layer, gradient, descent_values, learning_rate, iteration)
 
         return new_descent_values
 
@@ -283,7 +293,7 @@ class Dense(Layer):
         return [self.depth, self.weight_initializer, self.bias_initializer], self.layer
 
     def load(self, data, dtype):
-        self.layer = tf.convert_to_tensor(data, dtype=dtype)
+        self.layer = tf.Variable(tf.convert_to_tensor(data, dtype=dtype))
 
 class ConcatBlock(Layer):
     def __init__(self, layers, residual_layers, axis=-1):
@@ -318,11 +328,14 @@ class ConcatBlock(Layer):
     def backward(self, output_gradient):
         gradients = [None] * len(self.layers)
 
-        slices = [slice(None)] * output_gradient.ndim
-        slices[self.axis] = slice(None, self.main_activations_depth)
-        slices = tuple(slices)
+        tf.print(self.main_slices, "BRO WHAT")
+        tf.print(self.residual_slices, "BRO WHAT")
 
-        _output_gradient = output_gradient[slices]
+        begin = [0] * len(output_gradient.shape)
+        size = [-1] * len(output_gradient.shape)
+        begin[self.axis] = 0
+        size[self.axis] = self.main_activations_depth
+        _output_gradient = tf.slice(output_gradient, begin, size)
 
         for idx, layer in enumerate(self.layers[::-1]):
             current_layer_index = -(idx + 1)
@@ -334,11 +347,11 @@ class ConcatBlock(Layer):
 
         residual_gradients = [None] * len(self.residual_layers)
 
-        slices = [slice(None)] * output_gradient.ndim
-        slices[self.axis] = slice(self.main_activations_depth, None)
-        slices = tuple(slices)
-
-        residual_output_gradient = output_gradient[..., self.main_activations_depth:]
+        begin = [0] * len(output_gradient.shape)
+        size = [-1] * len(output_gradient.shape)
+        begin[self.axis] = self.main_activations_depth
+        size[self.axis] = -1
+        residual_output_gradient = tf.slice(output_gradient, begin, size)
 
         for idx, layer in enumerate(self.residual_layers[::-1]):
             current_layer_index = -(idx + 1)
@@ -363,11 +376,27 @@ class ConcatBlock(Layer):
             residual_output_shape = layer.output_shape
             print(layer, residual_output_shape, "RES")
 
+        self.main_slices = [slice(None) for _ in range(len(output_shape))]
+        self.main_slices[self.axis] = slice(0, output_shape[self.axis])
+        self.main_slices = [slice(None)] + self.main_slices # For batch dimension
+        self.main_slices = tuple(self.main_slices)
+
+        self.residual_slices = [slice(None) for _ in range(len(output_shape))]
+        self.residual_slices[self.axis] = slice(output_shape[self.axis], output_shape[self.axis] + residual_output_shape[self.axis])
+        self.residual_slices = [slice(None)] + self.residual_slices # For batch dimension
+        self.residual_slices = tuple(self.residual_slices)
+
         self.output_shape = output_shape
         self.output_shape[self.axis] += residual_output_shape[self.axis]
+        self.dtype = dtype
 
-    def update(self, optimizer, gradient, descent_values, learning_rate, iteration):
-        gradients, residual_gradients = gradient
+    def update(self, optimizer, gradient, descent_values, learning_rate, iteration, apply=True):
+        if gradient:
+            gradients, residual_gradients = gradient
+
+        else:
+            gradients = [None] * len(self.layers)
+            residual_gradients = [None] * len(self.residual_layers)
 
         if descent_values:
             descent_values, residual_descent_values = descent_values
@@ -379,13 +408,13 @@ class ConcatBlock(Layer):
         new_descent_values = []
 
         for layer, layer_gradient, descent_value in zip(self.layers, gradients, descent_values):
-            new_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate, iteration)
+            new_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate, iteration, apply=apply)
             new_descent_values.append(new_descent_value)
 
         new_residual_descent_values = []
 
         for layer, layer_gradient, descent_value in zip(self.residual_layers, residual_gradients, residual_descent_values):
-            new_residual_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate, iteration)
+            new_residual_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate, iteration, apply=apply)
             new_residual_descent_values.append(new_residual_descent_value)
 
         return [new_descent_values, new_residual_descent_values]
@@ -464,14 +493,15 @@ class ResidualBlock(Layer):
             output_shape = layer.output_shape
 
         self.output_shape = output_shape
+        self.dtype = dtype
 
-    def update(self, optimizer, gradients, descent_values, learning_rate, iteration):
+    def update(self, optimizer, gradients, descent_values, learning_rate, iteration, apply=True):
         new_descent_values = []
         if descent_values is None:
             descent_values = [None] * len(self.layers)
 
         for layer, layer_gradient, descent_value in zip(self.layers, gradients, descent_values):
-            new_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate, iteration)
+            new_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate, iteration, apply=apply)
             new_descent_values.append(new_descent_value)
             del new_descent_value
 
@@ -533,10 +563,11 @@ class ConcatStartPoint(Concat):
     def backward(self, output_gradient):
         output_gradient = output_gradient + self.parent.start_res.output_gradient # Add output_gradient coming from main layer to output_gradient from res layers
         del self.parent.start_res.output_gradient, self.parent.end_point.output_gradient
-        return output_gradient, []
+        return output_gradient, tf.constant(0, output_gradient.dtype)
 
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         self.parent.start_point.output_shape = input_shape
+        self.dtype = dtype
 
     def save(self):
         return [self.parent], None
@@ -557,11 +588,12 @@ class ConcatResidualStartPoint(Concat):
         slices[self.parent.axis] = slice(None, self.parent.end_point.main_activations_depth)
         slices = tuple(slices)
 
-        return self.parent.end_point.output_gradient[slices], [] # Pass the output_gradient corresponding to the main layers
+        return self.parent.end_point.output_gradient[slices], tf.constant(0, output_gradient.dtype) # Pass the output_gradient corresponding to the main layers
 
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         self.parent.start_res.output_shape = self.parent.start_point.output_shape
         self.parent.start_res.input_shape = input_shape
+        self.dtype = dtype
 
     def save(self):
         return [self.parent], None
@@ -587,11 +619,12 @@ class ConcatEndPoint(Concat):
         slices[self.parent.axis] = slice(self.parent.end_point.main_activations_depth, None)
         slices = tuple(slices)
 
-        return self.parent.end_point.output_gradient[slices], [] # Pass the output_gradient corresponding to the residual layers
+        return self.parent.end_point.output_gradient[slices], tf.constant(0, output_gradient.dtype) # Pass the output_gradient corresponding to the residual layers
 
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         self.parent.end_point.output_shape = input_shape
         self.parent.end_point.output_shape[self.parent.axis] += self.parent.start_res.input_shape[self.parent.axis]
+        self.dtype = dtype
 
     def save(self):
         return [self.parent], None
@@ -612,8 +645,8 @@ class BatchNorm(Layer):
         axes = tf.range(tf.rank(input_activations) - 1)
 
         if training:
-            self.batch_mean = tf.reduce_mean(input_activations, axis=axes, keepdims=True)
-            self.batch_var = tf.math.reduce_variance(input_activations, axis=axes, keepdims=True)
+            self.batch_mean = tf.reduce_mean(input_activations, axis=axes)
+            self.batch_var = tf.math.reduce_variance(input_activations, axis=axes)
 
             x_norm = (input_activations - self.batch_mean) / tf.sqrt(self.batch_var + self.epsilon)
 
@@ -649,23 +682,28 @@ class BatchNorm(Layer):
         
         return input_gradient, [gamma_gradient, beta_gradient]
 
-    def update(self, optimizer, gradient, descent_values, learning_rate, iteration):
-        dgamma, dbeta = gradient
-
+    def update(self, optimizer, gradient, descent_values, learning_rate, iteration, apply=True):
+        if not apply:
+            return [optimizer.cache_shape, optimizer.cache_shape]
+        
         if descent_values is not None:
             gamma_descent_values, beta_descent_values = descent_values
         else:
             gamma_descent_values = None
             beta_descent_values = None
+        
+        dgamma, dbeta = gradient
 
         dgamma = tf.cast(dgamma, dtype=self.gamma.dtype)
         dbeta = tf.cast(dbeta, dtype=self.beta.dtype)
 
-        self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * self.batch_mean
-        self.running_var = self.momentum * self.running_var + (1 - self.momentum) * self.batch_var
+        
 
-        self.gamma, new_gamma_descent_values = optimizer.apply_gradient(self.gamma, dgamma, gamma_descent_values, learning_rate, iteration)
-        self.beta, new_beta_descent_values = optimizer.apply_gradient(self.beta, dbeta, beta_descent_values, learning_rate, iteration)
+        self.running_mean.assign((self.momentum * self.running_mean + (1 - self.momentum) * self.batch_mean))
+        self.running_var.assign((self.momentum * self.running_var + (1 - self.momentum) * self.batch_var))
+
+        new_gamma_descent_values = optimizer.apply_gradient(self.gamma, dgamma, gamma_descent_values, learning_rate, iteration)
+        new_beta_descent_values = optimizer.apply_gradient(self.beta, dbeta, beta_descent_values, learning_rate, iteration)
 
         return [new_gamma_descent_values, new_beta_descent_values]
 
@@ -678,22 +716,23 @@ class BatchNorm(Layer):
             features = input_shape
 
         if initialize_weights:
-            self.gamma = tf.ones((features,), dtype=dtype)
-            self.beta = tf.zeros((features,), dtype=dtype)
-            self.running_mean = tf.zeros((features,), dtype=dtype)
-            self.running_var = tf.ones((features,), dtype=dtype)
+            self.gamma = tf.Variable(tf.ones((features,), dtype=dtype), trainable=True)
+            self.beta = tf.Variable(tf.zeros((features,), dtype=dtype), trainable=True)
+            self.running_mean = tf.Variable(tf.zeros((features,), dtype=dtype), trainable=True)
+            self.running_var = tf.Variable(tf.ones((features,), dtype=dtype), trainable=True)
 
         self.output_shape = input_shape
+        self.dtype = dtype
 
     def save(self):
         return [self.momentum], [self.gamma, self.beta, self.running_mean, self.running_var]
 
     def load(self, data, dtype):
         self.gamma, self.beta, self.running_mean, self.running_var = data
-        self.gamma = tf.constant(tf.cast(self.gamma, dtype=dtype), dtype=dtype)
-        self.beta = tf.constant(tf.cast(self.beta, dtype=dtype), dtype=dtype)
-        self.running_mean = tf.constant(tf.cast(self.running_mean, dtype=dtype), dtype=dtype)
-        self.running_var = tf.constant(tf.cast(self.running_var, dtype=dtype), dtype=dtype)
+        self.gamma = tf.Variable(tf.cast(self.gamma, dtype=dtype), dtype=dtype)
+        self.beta = tf.Variable(tf.cast(self.beta, dtype=dtype), dtype=dtype)
+        self.running_mean = tf.Variable(tf.cast(self.running_mean, dtype=dtype), dtype=dtype)
+        self.running_var = tf.Variable(tf.cast(self.running_var, dtype=dtype), dtype=dtype)
 
 class Space2Depth(Layer):
     def __init__(self, block_size):
@@ -711,12 +750,13 @@ class Space2Depth(Layer):
         return tf.nn.depth_to_space(
                 output_gradient, 
                 self.block_size
-            ), []
+            ), tf.constant(0, output_gradient.dtype)
 
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         self.output_shape = input_shape[:]
         self.output_shape[-1] *= self.block_size ** 2
         self.output_shape[:-1] //= self.block_size
+        self.dtype = dtype
 
     def save(self):
         return [self.block_size], None
@@ -737,12 +777,13 @@ class Depth2Space(Layer):
         return tf.nn.space_to_depth(
                 output_gradient, 
                 self.block_size
-            ), []
+            ), tf.constant(0, output_gradient.dtype)
 
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         self.output_shape = input_shape[:]
         self.output_shape[-1] //= self.block_size ** 2
         self.output_shape[:-1] *= self.block_size
+        self.dtype = dtype
 
     def save(self):
         return [self.block_size], None
@@ -780,11 +821,12 @@ class Upsample(Layer):
         
         del self.input_shape
 
-        return gradient, []
+        return gradient, tf.constant(0, output_gradient.dtype)
 
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         self.output_shape = input_shape[:]
         self.output_shape[:2] *= self.scale_factor
+        self.dtype = dtype
 
     def save(self):
         return [self.scale_factor, self.method], None
@@ -833,7 +875,7 @@ class MaxPool(Layer):
         input_gradient = tf.reshape(input_gradient, input_shape)
         del self.pooling_indices, self.input_shape
         
-        return input_gradient, []
+        return input_gradient, tf.constant(0, output_gradient.dtype)
 
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         output_shape = np.array(input_shape).copy()
@@ -844,6 +886,7 @@ class MaxPool(Layer):
             output_shape[:-1] = ((input_shape[:-1] - self.pooling_shape) // np.array(self.pooling_stride)).astype(int) + 1
 
         self.output_shape = output_shape
+        self.dtype = dtype
 
     def save(self):
         return [self.pooling_shape, self.pooling_stride, self.padding], None
@@ -865,7 +908,7 @@ class Dropout(Layer):
     def backward(self, output_gradient):
         input_gradient = output_gradient * self.mask
         del self.mask
-        return input_gradient, []
+        return input_gradient, tf.constant(0, output_gradient.dtype)
 
     def save(self):
         return [self.dropout_rate], None

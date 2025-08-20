@@ -2,6 +2,7 @@ from functools import partial
 import numpy as np, cupy as cp, time
 import tensorflow as tf
 from tensorflow.experimental.dlpack import from_dlpack, to_dlpack
+import tensorflow_probability as tfp
 from PIL import Image, ImageTk, ImageDraw
 
 class Processing:
@@ -57,7 +58,7 @@ class ClipGradient:
 
         return gradient
 
-    def forward(self, gradient):
+    def __call__(self, gradient):
         return self._clip_gradient(gradient)
 
 
@@ -65,7 +66,7 @@ class ClipGradient:
 class AutoClipper:
     def __init__(self, percentile, history_size=10000):
         self.percentile = percentile
-        self.norm_history = tf.Variable(tf.zeros(history_size, dtype=tf.float32))
+        self.norm_history = tf.Variable(tf.zeros(history_size, dtype=tf.float32), trainable=False)
         self.history_size = history_size
         self.iteration = tf.Variable(0, dtype=tf.int32)
 
@@ -108,19 +109,21 @@ class AutoClipper:
         
         return clipped_gradient
 
-    def forward(self, gradient):
+    def __call__(self, gradient):
         total_norm = self._get_total_norm(gradient)
 
         update_index = tf.math.mod(self.iteration, self.history_size)
-        self.norm_history = tf.tensor_scatter_nd_update(
-            self.norm_history, 
-            [[update_index]], 
-            [total_norm]
+        self.norm_history.assign(
+                self.norm_history.scatter_nd_update(
+                    indices=[[update_index]], 
+                    updates=[total_norm]
+            )
         )
+
         self.iteration.assign_add(1)
 
         sorted_norms = tf.sort(self.norm_history[:self.iteration])
-        clip_norm = Processing.to_tensorflow(cp.percentile(cp.array(self.norm_history[:self.iteration]), q=self.percentile))
+        clip_norm = tfp.stats.percentile(self.norm_history[: self.iteration], q=self.percentile)
 
         print("[LOG] Clip Value:", clip_norm)
 

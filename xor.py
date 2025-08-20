@@ -18,7 +18,7 @@ if __name__ == "__main__":
 
     print(model)
 
-    network = Network(model, loss_function=MSE(), optimizer=Adam(momentum=0.9, beta_constant=0.99))
+    network = Network(model, loss_function=CrossEntropy(), optimizer=Adam(momentum=0.9, beta_constant=0.99))
     network.compile()
     
     training_percent = 1
@@ -27,7 +27,11 @@ if __name__ == "__main__":
     save_file = 'model-training-data.json'
 
     xdata = [[i % 2, i // 2] for i in range(4)]
-    ydata = [[[(i % 2) ^ (i // 2), 1 - ((i % 2) ^ (i // 2))]] for i in range(4)]
+    ydata = [
+            [
+                [(i % 2) ^ (i // 2), 1 - ((i % 2) ^ (i // 2))]
+            ] for i in range(4)
+        ]
 
 
     costs = []
