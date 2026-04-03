@@ -11,7 +11,7 @@ if __name__ == "__main__":
     model = [
         Input(2),
         Dense(3),
-        Activation(LRelu()),
+        Activation(Silu()),
         Dense(2),
         Activation(Sigmoid()),
     ]
@@ -27,11 +27,11 @@ if __name__ == "__main__":
     save_file = 'model-training-data.json'
 
     xdata = [[i % 2, i // 2] for i in range(4)]
-    ydata = [
+    ydata = np.array([
             [
                 [(i % 2) ^ (i // 2), 1 - ((i % 2) ^ (i // 2))]
             ] for i in range(4)
-        ]
+        ])
 
 
     costs = []
