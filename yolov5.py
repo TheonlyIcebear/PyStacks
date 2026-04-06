@@ -1,23 +1,38 @@
 from utils.layers import *
 from utils.schedulers import *
 from utils.network import Network
+from utils.initializers import *
 from utils.loss import *
 from utils.activations import *
+from datetime import datetime
+from itertools import islice
 from sklearn.cluster import KMeans
 from utils.functions import Processing, AutoClipper, ClipGradient
 from utils.optimizers import Adam, Momentum, RMSProp, SGD
 from PIL import Image
 from tqdm import tqdm
+from queue import Queue
+from collections import deque
 import matplotlib.animation as animation
 from matplotlib.ticker import MaxNLocator
 import albumentations as A, matplotlib.pyplot as plt
-import multiprocessing, threading, numpy as np, pickle, time, json, cv2, os
+from typing import Annotated, Any, Literal, Union, cast
+import multiprocessing, threading, collections, numpy as np, pickle, time, json, cv2, os
+import time
+import random
+import tf2onnx
 
 class Generate:
-    def __init__(self, batch_size, anchor_dimensions, dimensions, grid_size, anchors, classes, choices, iou_ignore_threshold = 0.72, data_augmentation=True):
+    def __init__(self, batch_size, anchor_dimensions, dimensions, grid_size, anchors, classes, choices, buffer_size, iou_ignore_threshold = 0.8, data_augmentation=True):
+        global augmentor
         self.batch_size = batch_size
 
-        self.anchor_dimensions = anchor_dimensions
+        anchor_dimensions = anchor_dimensions
+        self.formatted_anchor_dimensions = np.concatenate(
+            (np.full((anchor_dimensions.shape[0], 2), 0), 
+            anchor_dimensions
+        ), axis=-1), # [[0, 0, w, h], ...]
+
         self.data_augmentation = data_augmentation
 
         self.image_width, self.image_height = dimensions
@@ -25,198 +40,241 @@ class Generate:
         self.dataset_size = len(choices)
         self.choices = choices
 
-        manager = multiprocessing.Manager()
-        self.buffer = manager.list()
-        self.buffer_size = batch_size
+        self.buffer = multiprocessing.Manager().Queue(maxsize=buffer_size)
+        self.buffer_size = buffer_size
 
         self.grid_size = grid_size
         self.anchors = anchors
         self.classes = classes
 
         self.iou_ignore_threshold = iou_ignore_threshold
+        self.local_buffer = deque()
 
-        multiprocessing.Process(target=self.fill_buffer).start()
+        with open("annotations\\classes.txt", "r+") as file:
+            self.class_names = file.read().splitlines()
 
-    def fill_buffer(self):
-        augmentor = A.Compose([
-            A.HorizontalFlip(p=0.5),
-            
-            A.OneOf([
-                A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.75),
-                A.RandomBrightnessContrast(
-                    brightness_limit=0.5,
-                    contrast_limit=0.5,
-                    p=0.75
-                )
-            ], p=0.3),
+        self.class_to_idx = {name: i for i, name in enumerate(self.class_names)}
 
-            A.Perspective(scale=(0.05, 0.1), p=0.3),
-            A.Affine( 
-                rotate=(-2, 2),
-                translate_percent=(-0.03, 0.03),
-                rotate_method="largest_box",
-                keep_ratio=True,
-                balanced_scale=True,
-                p=0.3,
-                border_mode=cv2.BORDER_CONSTANT
+        self.count = 0
+
+        self.workers = 1  # or 6–8 depending on CPU
+
+        threading.Thread(target=self.prefetch_to_local, daemon=True).start()
+
+        for _ in range(self.workers):
+            multiprocessing.Process(target=fill_buffer, args=(
+                self.buffer,
+                self.choices,
+                augmentor,
+                anchor_dimensions,
+                self.formatted_anchor_dimensions,
+                self.image_width,
+                self.image_height,
+                self.batch_size,
+                self.grid_size,
+                self.anchors,
+                self.classes,
+                self.class_names,
+                self.class_to_idx,
+                self.iou_ignore_threshold,
+                self.data_augmentation
             ),
+            daemon=True).start()
 
-            A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.25),
-            
-            A.RandomResizedCrop(
-                size=[self.image_width, self.image_height],
-                scale=[0.4, 0.85],
-                ratio=[1, 1],
-                interpolation=cv2.INTER_LINEAR,
-                mask_interpolation=cv2.INTER_NEAREST,
-                p=1
-            ),
-
-        ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.25, label_fields=['class_labels']))
-        all_filenames = np.array(os.listdir('Training'))
-        
-        while True:
-            if len(self.buffer) >= self.buffer_size:
-                continue
-
-            choices = np.random.choice(self.choices, size=self.buffer_size - len(self.buffer), replace=False)
-            filenames = all_filenames[choices]
-
-            buffer_extension = []
-
-            for idx, filename in enumerate(filenames):
-                locations_filename = f'annotations\\{filename.replace(".png", ".txt").replace(".jpg", ".txt")}'
-
-                if os.path.exists(locations_filename):
-                    with open(locations_filename, "r+") as file:
-                        lines = file.read().splitlines()
-
-                        if not lines:
-                            continue
-
-                        location_data = np.clip(np.array([
-                            [
-                                float(value) for value in line.split(' ')
-                            ] for line in lines
-                        ]), [[0, 0, 0, 0 ,0 ]], [[self.classes-1, 1, 1, 1, 1]])
-
-
-                else:
-                    location_data = np.array([])
-
-                try:
-                    root_image = cv2.resize(
-                                    cv2.cvtColor(
-                                            cv2.imread(f'Training\\{filename}'), 
-                                            cv2.COLOR_BGR2RGB
-                                        ), (self.image_width, self.image_height)
-                                    )
-                except Exception as e:
-                    print(filename, e, "[LOG] BROKEN")
-                    continue
-                
-                with open("annotations\\classes.txt", "r+") as file:
-                    class_names = file.read().splitlines()
-
-                class_labels = [class_names[int(bbox[0])] for bbox in location_data]
-
-                # Properly define class_names for every bbox then intepret new classs from augmented_result['class_labels']
-
-                if self.data_augmentation:
-                    try:
-                        augmented_result = augmentor(image=root_image, bboxes=[np.clip(data[1:5], 0, 1) for data in location_data], class_labels=class_labels)
-                        bboxes = np.array(augmented_result['bboxes'])
-                        class_labels = augmented_result['class_labels']
-                        image = augmented_result['image']
-                    except ValueError as e:
-                        print(location_data, filename, "[LOG] ValueError in augmentation")
-                        print(f"[LOG] Error in augmentation for {filename}: {e}")
-                        continue
-
-                else:
-                    bboxes = np.array(location_data)
-                    image = root_image
-
-                class_ints = np.array([class_names.index(label) for label in class_labels])
-
-                image = image / 255
-
-                ydata = [np.zeros((self.grid_size * 2 ** (2 - i), self.grid_size * 2 ** (2 - i), self.anchors, 5 + self.classes)) for i in range(3)]
-
-                for class_int, (true_center_x, true_center_y, width, height) in zip(class_ints, bboxes):
-
-                    formatted_anchor_dimensions = np.concatenate(
-                        (np.full((self.anchor_dimensions.shape[0], 2), 0), 
-                        self.anchor_dimensions
-                    ), axis=-1), # [[0, 0, w, h], ...]
-
-                    iou_values = Processing.iou(
-                        np.array(formatted_anchor_dimensions),
-                        np.array([0, 0, width, height]),
-                        api=np
-                    )[0, :, 0]
-
-                    anchor_indices = iou_values.argsort()[::-1]
-
-                    has_anchor = [False, False, False]
-
-                    classes = np.zeros((self.classes))
-                    classes[int(class_int)] = 1
-
-                    for anchor_index in anchor_indices:
-                        scale_idx = anchor_index // self.anchors
-                        anchor_on_scale = anchor_index % self.anchors
-
-
-                        _grid_size = self.grid_size * 2 ** (2-scale_idx)
-
-                        grid_x_index = int(true_center_x * _grid_size)
-                        grid_y_index = int(true_center_y * _grid_size)
-
-                        relative_center_x = true_center_x * _grid_size - grid_x_index
-                        relative_center_y = true_center_y * _grid_size - grid_y_index
-
-                        # Adjust for grid sensitivity
-                        relative_center_x = (relative_center_x + 0.5) / 2
-                        relative_center_y = (relative_center_y + 0.5) / 2
-                
-                        # t_w and t_h calculation:
-                        _width = 0.5 * np.sqrt(width / self.anchor_dimensions[anchor_index, 0])
-                        _height = 0.5 * np.sqrt(height / self.anchor_dimensions[anchor_index, 1])
-
-                        occupied = ydata[scale_idx][grid_y_index, grid_x_index, anchor_on_scale, 0]
-                        if not occupied and not has_anchor[scale_idx]:
-                            has_anchor[scale_idx] = True
-                            ydata[scale_idx][grid_y_index, grid_x_index, anchor_on_scale] = np.concatenate(([1, relative_center_x, relative_center_y, _width, _height], classes))
-
-                        elif not occupied and iou_values[anchor_index] > self.iou_ignore_threshold:
-                            ydata[scale_idx][grid_y_index, grid_x_index, anchor_on_scale, 0] = -1
-                    
-                ydata = [scale.reshape(self.grid_size * 2 ** (2 - i), self.grid_size * 2 ** (2 - i), self.anchors, (5 + self.classes)) for i, scale in enumerate(ydata)]
-                buffer_extension.append((image, ydata))
-            try:
-                self.buffer += buffer_extension
-            except:
-                continue
+    def prefetch_to_local(self): 
+        while True: 
+            image, ydata = self.buffer.get()
+            self.local_buffer.append((image, ydata))
 
     def __call__(self):
-        choices = np.random.choice(self.choices, size=self.batch_size, replace=False)
+        while len(self.local_buffer)< self.batch_size:
+            time.sleep(0.001)
+
+        batch_images = []
+        batch_ydatas = []
+
+        for _ in range(self.batch_size):
+            image, ydata = self.local_buffer.popleft()
+            batch_images.append(image)
+            batch_ydatas.append(ydata)
+
+        return np.array(batch_images), batch_ydatas
+
+def fill_buffer(
+        buffer,
+        choices,
+        augmentor,
+        anchor_dimensions,
+        formatted_anchor_dimensions,
+        image_width,
+        image_height,
+        batch_size,
+        grid_size,
+        anchors,
+        classes,
+        class_names,
+        class_to_idx,
+        iou_ignore_threshold,
+        data_augmentation
+    ):
+    all_filenames = np.array(os.listdir('Training'))
+
+    while True:
+        choices = np.random.choice(choices, size=batch_size, replace=False)
+        filenames = all_filenames[choices]
+
+        buffer_extension = []
+
+        for idx, filename in enumerate(filenames):
+            locations_filename = f'annotations\\{filename.replace(".png", ".txt").replace(".jpg", ".txt")}'
+
+            if os.path.exists(locations_filename):
+                with open(locations_filename, "r+") as file:
+                    lines = file.read().splitlines()
+
+                    if not lines:
+                        continue
+
+                    location_data = np.clip(np.array([
+                        [
+                            float(value) for value in line.split(' ')
+                        ] for line in lines
+                    ]), [[0, 0, 0, 0 ,0 ]], [[classes-1, 1, 1, 1, 1]])
+
+
+            else:
+                location_data = np.array([])
+
+            img = cv2.imread(f'Training\\{filename}')
+            if img is None:
+                continue
+            root_image = img[..., ::-1]
         
-        xdatas = []
-        ydatas = []
 
-        while len(self.buffer) < self.batch_size:
-            pass
+            class_labels = [class_names[int(bbox[0])] for bbox in location_data]
 
-        for idx in range(self.batch_size):
-            xdata, ydata = self.buffer[idx]
+            # Properly define class_names for every bbox then intepret new classs from augmented_result['class_labels']
 
-            xdatas.append(xdata)
-            ydatas.append(ydata)
+            if data_augmentation:
+                try:
+                    augmented_result = augmentor(image=root_image, bboxes=[np.clip(data[1:5], 0, 1) for data in location_data], class_labels=class_labels)
+                    bboxes = np.array(augmented_result['bboxes'])
+                    class_labels = augmented_result['class_labels']
+                    image = cv2.resize(augmented_result['image'], (image_width, image_height))
+                except ValueError as e:
+                    print(location_data, filename, "[LOG] ValueError in augmentation")
+                    print(f"[LOG] Error in augmentation for {filename}: {e}")
+                    continue
 
-        del self.buffer[:self.batch_size]
+            else:
+                bboxes = np.array(location_data)
+                image = cv2.resize(root_image, (image_width, image_height))
 
-        return np.array(xdatas), ydatas
+            class_ints = np.array([class_to_idx[label] for label in class_labels])
+
+            image = (image / 255).astype(np.float32)
+
+            ydata = [np.zeros((grid_size * 2 ** (2 - i), grid_size * 2 ** (2 - i), anchors, 5 + classes)) for i in range(3)]
+
+            for class_int, (true_center_x, true_center_y, width, height) in zip(class_ints, bboxes):
+
+                iou_values = Processing.iou(
+                    np.array(formatted_anchor_dimensions),
+                    np.array([0, 0, width, height]),
+                    api=np
+                )[0, :, 0]
+
+                anchor_indices = iou_values.argsort()[::-1]
+
+                has_anchor = [False, False, False]
+
+                _classes = np.zeros((classes))
+                _classes[int(class_int)] = 1
+
+                for anchor_index in anchor_indices:
+                    scale_idx = anchor_index // anchors
+                    anchor_on_scale = anchor_index % anchors
+
+
+                    _grid_size = grid_size * 2 ** (2-scale_idx)
+
+                    grid_x_index = int(true_center_x * _grid_size)
+                    grid_y_index = int(true_center_y * _grid_size)
+
+                    relative_center_x = true_center_x * _grid_size - grid_x_index
+                    relative_center_y = true_center_y * _grid_size - grid_y_index
+
+                    # Adjust for grid sensitivity
+                    relative_center_x = (relative_center_x + 0.5) / 2
+                    relative_center_y = (relative_center_y + 0.5) / 2
+            
+                    # t_w and t_h calculation:
+                    _width = 0.5 * np.sqrt(width / anchor_dimensions[anchor_index, 0])
+                    _height = 0.5 * np.sqrt(height / anchor_dimensions[anchor_index, 1])
+
+                    occupied = ydata[scale_idx][grid_y_index, grid_x_index, anchor_on_scale, 0]
+                    if not occupied and not has_anchor[scale_idx]:
+                        has_anchor[scale_idx] = True
+                        ydata[scale_idx][grid_y_index, grid_x_index, anchor_on_scale] = np.concatenate(([1, relative_center_x, relative_center_y, _width, _height], _classes))
+
+                    elif not occupied and iou_values[anchor_index] > iou_ignore_threshold:
+                        ydata[scale_idx][grid_y_index, grid_x_index, anchor_on_scale, 0] = -1
+            
+            buffer.put((image, ydata))
+            
+
+class RandomScaledCenterCrop(A.CenterCrop):
+    """
+    Center crop with random scale.
+
+    Args:
+        min_scale (float): Minimum fraction of the smallest image dimension to crop.
+        max_scale (float): Maximum fraction of the smallest image dimension to crop.
+        pad_if_needed, pad_position, border_mode, fill, fill_mask, p:
+            Same as CenterCrop.
+    """
+
+    def __init__(
+        self,
+        min_scale: float,
+        max_scale: float,
+        pad_if_needed: bool = False,
+        pad_position: Literal[
+            "center", "top_left", "top_right", "bottom_left", "bottom_right", "random"
+        ] = "center",
+        border_mode: int = cv2.BORDER_CONSTANT,
+        fill: float | tuple[float, ...] = 0,
+        fill_mask: float | tuple[float, ...] = 0,
+        p: float = 1.0,
+    ):
+        super().__init__(height=1, width=1,  # placeholders, will override
+                        pad_if_needed=pad_if_needed,
+                        pad_position=pad_position,
+                        border_mode=border_mode,
+                        fill=fill,
+                        fill_mask=fill_mask,
+                        p=p)
+        self.min_scale = min_scale
+        self.max_scale = max_scale
+
+    def get_params_dependent_on_data(
+        self, params: dict[str, Any], data: dict[str, Any]
+    ) -> dict[str, Any]:
+        # Get original image shape
+        image_shape = params["shape"][:2]
+        image_height, image_width = image_shape
+
+        # Determine random crop size
+        scale = random.uniform(self.min_scale, self.max_scale)
+        crop_size = int(min(image_height, image_width) * scale)
+
+        # Temporarily override height/width
+        self.height = crop_size
+        self.width = crop_size
+
+        # Call original CenterCrop method
+        return super().get_params_dependent_on_data(params, data)
+    
 
 def get_bboxes(choices):
     bboxes = np.empty((0, 5))
@@ -329,11 +387,12 @@ def get_anchor_data(grid_size, bboxes):
     aspect_ratio = np.maximum(dimensions[:, 0] / dimensions[:, 1], dimensions[:, 1] / dimensions[:, 0])
 
     # Remove outliers
-
+    
     dimensions = dimensions[aspect_ratio < 6] 
-    dimensions = dimensions[dimensions[:, 0] > 0.005] 
-    dimensions = dimensions[dimensions[:, 1] < 0.9]
-    dimensions = dimensions[dimensions[:, 0] * dimensions[:, 1] < 0.5] 
+    dimensions = dimensions[dimensions[:, 0] < 0.3] 
+    dimensions = dimensions[dimensions[:, 1] < 0.8]
+    dimensions = dimensions[dimensions[:, 1] > 0.05]
+    dimensions = dimensions[dimensions[:, 0] * dimensions[:, 1] < 0.3] 
     dimensions = dimensions[dimensions[:, 0] * dimensions[:, 1] > 0.001]
     
 
@@ -347,7 +406,6 @@ def get_anchor_data(grid_size, bboxes):
     plt.figure(figsize=(8, 8))
 
     anchor_dimensions, labels = iou_kmeans(dimensions, dimensions_count)
-    print(anchor_dimensions, labels)
 
     for idx, (label, wh) in enumerate(zip(labels, dimensions)):
         clusters[label] = np.vstack((clusters[label], wh))
@@ -399,6 +457,8 @@ def get_anchor_data(grid_size, bboxes):
         marker='x',
         s=100
     )
+
+    print("[LOG] Anchor data:\n", anchor_dimensions)
     
     plt.title("Bounding Box Dimensions vs. Anchor Boxes", fontsize=14)
     plt.xlabel("Width", fontsize=12)
@@ -412,58 +472,68 @@ def get_anchor_data(grid_size, bboxes):
     plt.plot()
     plt.show()
 
-    print("[LOG] Anchor data:\n", anchor_dimensions)
-
     return anchor_dimensions, class_occurrences, objects_per_scale
 
 def save():
-    
     save_data = network.save()
-    
+
     with open(save_file, 'wb') as file:
         file.write(pickle.dumps(save_data))
 
+    
+    spec = tf.TensorSpec([1, image_height, image_width, 3], tf.float16)
+
+    graphed_forward = tf.function(lambda x: network.forward(x, training=False), input_signature=[spec])
+
+    onnx_model, _ = tf2onnx.convert.from_function(
+        graphed_forward,
+        input_signature=[spec],
+        opset=17,
+        output_path="model-training-data.onnx"
+    )
+
     with open("cost-overtime.json", "w+") as file:
-        file.write(json.dumps(costs))
+        file.write(json.dumps(costs.tolist()))
 
-def plot_worker(queue, yolo_head_count, grid_size, batch_size, accumulate, dataset_size, titles, colors):
-    plt.ion()
-    fig = plt.figure(figsize=(16, 6))
-    costs = []
+def init_plot(yolo_head_count, titles):
+    for i in range(yolo_head_count):
+        row = []
+        ax_row = []
+        for j in range(len(titles)):
+            ax = fig.add_subplot(yolo_head_count, len(titles),
+                                 (i * len(titles)) + j + 1)
+            (line,) = ax.plot([], [])  # empty line object
+            ax_row.append(ax)
+            row.append(line)
+        lines.append(row)
+        axes.append(ax_row)
 
-    while True:
-        try:
-            idx, new_cost = queue.get(timeout=1)
-            costs.append(new_cost)
-            
-            plt.clf()
+def live_plot(costs_np, x_values, yolo_head_count, titles, colors, grid_size):
+    for i in range(yolo_head_count):
+        for j in range(len(titles)):
+            ax = axes[i][j]
+            line = lines[i][j]
 
-            for i in range(yolo_head_count):
-                for j in range(len(titles)):
-                    plt.subplot(yolo_head_count, len(titles), (i * len(titles)) + j + 1)
-                    data = np.array(costs)[:, i, j]
-                    plt.plot(np.arange(len(costs)) * (batch_size / (dataset_size * accumulate)), data, colors[j], label=titles[j])
-                    plt.xscale('linear')
-                    plt.yscale('linear')
+            # Update the line data (VERY fast)
+            line.set_data(x_values, costs_np[:, i, j])
 
-                    ax = plt.gca()
-                    ax.xaxis.set_major_locator(MaxNLocator(nbins=10))
-                    ax.yaxis.set_major_locator(MaxNLocator(nbins=10))
-                    plt.title(f"{grid_size * 2 ** (yolo_head_count - i - 1)}x{grid_size * 2 ** (yolo_head_count - i - 1)} ({titles[j]})")
+            ax.relim()  # recompute data limits
+            ax.autoscale_view()
 
-            plt.tight_layout()
-            plt.draw()
-            plt.pause(0.001)
-        except multiprocessing.queues.Empty:
-            continue
-        except Exception as e:
-            print("Plot error:", e)
+            grid = grid_size * (2 ** (yolo_head_count - i - 1))
+            ax.set_title(f"{grid}x{grid} ({titles[j]})")
 
+            line.set_color(colors[j])
+
+    
 def conv(depth, kernel_shape, stride=1, padding="SAME"):
     return [
-        Conv2d(depth=depth, kernel_shape=kernel_shape, stride=stride, padding=padding),
-        BatchNorm(momentum=0.99),
-        Activation(activation_function)
+        Conv2d(depth=depth, kernel_shape=kernel_shape, stride=stride, padding=padding, batch_norm=BatchNorm(
+            momentum=0.99,
+            baked=True
+        ), 
+        activation_function=activation_function,
+        weight_initializer=HeNormal(), bias_initializer=Fill(0)),
     ]
 
 def res_block(filters):
@@ -480,29 +550,30 @@ def long_res_block(filters, repeats):
     return block
 
 def csp_block(filters, repeats, residual=True):
-    concat_start, residual_start, concat_end = Concat().generate_layers()
+    concat_start, residual_start, concat_end = Concat(external_concat=optimize_concats).generate_layers()
     return [
-        concat_start,
-            *conv(filters, (1, 1), padding="SAME"),
-            *(long_res_block(filters, repeats) if residual else [
+        concat_start, # 1 
+            *conv(filters, (1, 1), padding="SAME"), # 2
+            *(long_res_block(filters, repeats) if residual else [ # 4
                     *conv(filters, (1, 1), padding="SAME"), 
                     *conv(filters, (3, 3), padding="SAME")
                 ]),
 
-        residual_start,
-            *conv(filters, (1, 1), padding="SAME"),
+        residual_start, # 5
+            *conv(filters, (1, 1), padding="SAME"), # 6
 
-        concat_end,
-    ] # 15 layers
+        concat_end, # 7
+    ] # 7 layers
 
 def sppf():
-    concat_start1, residual_start1, concat_end1 = Concat().generate_layers()
-    concat_start2, residual_start2, concat_end2 = Concat().generate_layers()
-    concat_start3, residual_start3, concat_end3 = Concat().generate_layers()
+    global scale
+    concat_start1, residual_start1, concat_end1 = Concat(external_concat=optimize_concats).generate_layers()
+    concat_start2, residual_start2, concat_end2 = Concat(external_concat=optimize_concats).generate_layers()
+    concat_start3, residual_start3, concat_end3 = Concat(external_concat=optimize_concats).generate_layers()
 
     return [
         
-        *conv(512, (1, 1), padding="SAME"),
+        *conv(int(512 * scale), (1, 1), padding="SAME"),
         concat_start1,
             MaxPool((5,5), pooling_stride=(1, 1), padding="SAME"),
 
@@ -521,15 +592,15 @@ def sppf():
         residual_start1,
         concat_end1,
 
-        *conv(1024, (1,1), padding="SAME")
+        *conv(int(1024 * scale), (1,1), padding="SAME")
     ]
 
 if __name__ == "__main__":
-    training_percent = 1700/1804
-    batch_size = 16
+    training_percent = 0.975
+    batch_size = 32
     accumulate = 1
 
-    image_width, image_height = [512, 512]
+    image_width, image_height = [416, 416]
     yolo_head_count = 3
     
     grid_size = int(image_width / 32)
@@ -538,107 +609,93 @@ if __name__ == "__main__":
     anchors = 3
     classes = 3
 
+    yolo_size = 1 # 1: small, 2: medium, 3: large
+
+    scale = 0.5 + (0.25) * (yolo_size - 1)
+    depth_mult = yolo_size / 3
+
+    def R(x):
+        return max(1, np.int32(np.ceil(x * depth_mult)))
+
     dropout_rate = 0
-    activation_function = Silu()
+    activation_function = Mish()
+    optimize_concats = True
     variance = "He"
     dtype = np.float16
 
     save_file = 'model-training-data.json'
-    dataset_size = len(os.listdir('Training'))
-    choices = np.random.choice(dataset_size, size=int(dataset_size * training_percent), replace=False)
+    dataset_size = int(len(os.listdir('Training')) * training_percent)
+    choices = np.random.choice(dataset_size, size=dataset_size, replace=False)
 
     with open('training-files.json', 'w+') as file:
         file.write(json.dumps(choices.tolist()))
 
-    augmentor = A.Compose([
-        A.HorizontalFlip(p=0.5),
-        
-        A.OneOf([
-            A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=0.75),
-            A.RandomBrightnessContrast(
-                brightness_limit=0.3,
-                contrast_limit=0.3,
-                p=0.75
-            ),
-            A.ToGray(p=0.5),
-        ], p=0.3),
-        
-        A.OneOf([
-            A.MedianBlur(blur_limit=3, p=0.75),
-            A.Blur(blur_limit=3, p=0.75),
-        ], p=0.3),
-
-        A.Perspective(scale=(0.05, 0.1), p=0.3),
-        A.Affine( 
-            rotate=(-3, 3),
-            translate_percent=(-0.03, 0.03),
-            rotate_method="largest_box",
-            keep_ratio=True,
-            balanced_scale=True,
-            p=0.3,
-            border_mode=cv2.BORDER_CONSTANT
-        ),
-
-        A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.3),
-        
-        A.RandomResizedCrop(
-            size=[image_width, image_height],
-            scale=[0.6, 1],
-            ratio=[1, 1],
-            interpolation=cv2.INTER_LINEAR,
-            mask_interpolation=cv2.INTER_NEAREST,
-            p=0.3
-        ),
-
-        A.CLAHE(clip_limit=(1, 4), tile_grid_size=(8, 8), p=0.05)
-
-    ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.25, label_fields=['class_labels']))
     
+
+    augmentor = A.Compose([
+        A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.75),
+        A.RandomBrightnessContrast(
+            brightness_limit=[-0.07, 0.07],
+            contrast_limit=[-0.07, 0.07],
+            p=0.5
+        ),
+        A.HueSaturationValue(
+            hue_shift_limit=5,
+            sat_shift_limit=5,
+            val_shift_limit=5,
+            p=0.5
+        ),
+
+        RandomScaledCenterCrop(
+            min_scale=0.15, max_scale=0.5,
+        ),
+    ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.1, label_fields=['class_labels']))
+
     bboxes = get_bboxes(choices)
     anchor_dimensions, class_occurences, objects_per_scale = get_anchor_data(grid_size, bboxes)
     del bboxes
 
     median_dimension = np.mean(anchor_dimensions[anchor_dimensions.shape[0] // 2])
 
-    concat_start1, residual_start1, concat_end1 = Concat().generate_layers()
-    concat_start2, residual_start2, concat_end2 = Concat().generate_layers()
-    concat_start3, residual_start3, concat_end3 = Concat().generate_layers()
-    concat_start4, residual_start4, concat_end4 = Concat().generate_layers()
+    concat_start1, residual_start1, concat_end1 = Concat(external_concat=optimize_concats).generate_layers()
+    concat_start2, residual_start2, concat_end2 = Concat(external_concat=optimize_concats).generate_layers()
+    concat_start3, residual_start3, concat_end3 = Concat(external_concat=optimize_concats).generate_layers()
+    concat_start4, residual_start4, concat_end4 = Concat(external_concat=optimize_concats).generate_layers()
 
-    weight_initializer = YoloSplit(presence_initializer=HeNormal(), xy_initializer=HeNormal(), dimensions_initializer=HeNormal(), class_initializer=HeNormal(), classes=classes, anchors=3)
-    bias_initializer = YoloSplit(presence_initializer=Fill(np.log(0.05)), xy_initializer=Fill(0), dimensions_initializer=Fill(np.log(0.75)), class_initializer=Fill(0), classes=classes, anchors=3)
+    weight_initializer = YoloSplit(presence_initializer=HeNormal(), xy_initializer=HeNormal(), dimensions_initializer=LecunNormal(), class_initializer=HeNormal(), classes=classes, anchors=3)
+    bias_initializer = YoloSplit(presence_initializer=Fill(np.log(0.1)), xy_initializer=Fill(0), dimensions_initializer=Fill(0), class_initializer=Fill(0), classes=classes, anchors=3)
 
     model = [
         Input((image_height, image_width, 3)),
 
-        *conv(64, (6, 6), stride=2, padding="SAME"),
-        *conv(128, (3, 3), stride=2, padding="SAME"),
+        *conv(int(64 * scale), (6, 6), stride=2, padding="SAME"),
+        *conv(int(128 * scale), (3, 3), stride=2, padding="SAME"),
 
-        *csp_block(64, 3),
-        *conv(128, (1, 1), stride=1, padding="SAME"),
+        *csp_block(int(64 * scale), R(3)),
+        *conv(int(128 * scale), (1, 1), stride=1, padding="SAME"),
 
-        *conv(256, (3, 3), stride=2, padding="SAME"),
+        *conv(int(256 * scale), (3, 3), stride=2, padding="SAME"),
 
-        *csp_block(128, 6),
-        *conv(256, (1, 1), stride=1, padding="SAME"),
+        *csp_block(int(128 * scale), 6, R(6)),
+        *conv(int(256 * scale), (1, 1), stride=1, padding="SAME"),
 
         concat_start1,
 
-            *conv(512, (3, 3), stride=2, padding="SAME"),
+            *conv(int(512 * scale), (3, 3), stride=2, padding="SAME"),
 
-            *csp_block(256, 9),
-            *conv(512, (1, 1), stride=1, padding="SAME"),
+            *csp_block(int(256 * scale), R(9)),
+            *conv(int(512 * scale), (1, 1), stride=1, padding="SAME"),
 
             concat_start2,
 
-                *conv(1024, (3, 3), stride=2, padding="SAME"),
+                *conv(int(1024 * scale), (3, 3), stride=2, padding="SAME"),
 
-                *csp_block(512, 3),
-                *conv(1024, (1, 1), stride=1, padding="SAME"),
+                *csp_block(int(512 * scale), R(3)),
+                *conv(int(1024 * scale), (1, 1), stride=1, padding="SAME"),
 
                 *sppf(),
 
-                *conv(512, (1, 1), padding="SAME"),
+                *conv(int(512 * scale), (1, 1), padding="SAME"),
 
                 concat_start4,
                 Upsample(2),
@@ -646,10 +703,10 @@ if __name__ == "__main__":
             residual_start2,
             concat_end2,
 
-            *csp_block(512, 3, residual=False),
-            *conv(512, (1, 1), stride=1, padding="SAME"),
+            *csp_block(int(512 * scale), R(3), residual=False),
+            *conv(int(512 * scale), (1, 1), stride=1, padding="SAME"),
             
-            *conv(256, (1, 1), stride=1, padding="SAME"),
+            *conv(int(256 * scale), (1, 1), stride=1, padding="SAME"),
             concat_start3,
 
             Upsample(2),
@@ -657,29 +714,29 @@ if __name__ == "__main__":
         residual_start1,
         concat_end1,
 
-        *csp_block(256, 3, residual=False),
-        *conv(256, (1, 1), stride=1, padding="SAME"), # ROUTE 1
+        *csp_block(int(256 * scale), R(3), residual=False),
+        *conv(int(256 * scale), (1, 1), stride=1, padding="SAME"), # ROUTE 1
          
-        *conv(256, (3, 3), stride=2, padding="SAME"), # 46 layers
+        *conv(int(256 * scale), (3, 3), stride=2, padding="SAME"), # 24 layers
 
-        residual_start3, # 43 layers
-        concat_end3, # 42 layers
+        residual_start3, # 23 layers
+        concat_end3, # 22 layers
 
-        *csp_block(256, 3, residual=False), # 41 layers
-        *conv(512, (1, 1), stride=1, padding="SAME"), # ROUTE 2 (26 layers)
+        *csp_block(int(256 * scale), R(3), residual=False), # 7 layers (21 layers)
+        *conv(int(512 * scale), (1, 1), stride=1, padding="SAME"), # ROUTE 2 (14 layers)
 
-        *conv(512, (3, 3), stride=2, padding="SAME"), # 3 layers (23 layers)
+        *conv(int(512 * scale), (3, 3), stride=2, padding="SAME"), # 13 layers
 
-        residual_start4, # 20
-        concat_end4, # 19
+        residual_start4, # 12
+        concat_end4, # 11
 
-        *csp_block(512, 3, residual=False), # 18 layers
-        *conv(1024, (1, 1), stride=1, padding="SAME") # ROUTE 3 (3 layers)
+        *csp_block(int(512 * scale), 3, residual=False), # 7 layers (10 layers)
+        *conv(int(1024 * scale), (1, 1), stride=1, padding="SAME") # ROUTE 3 (3 layers)
     ]
 
     backprop_layer_indices = [
-        -47,
-        -24,
+        -25,
+        -14,
         -1,
     ]
 
@@ -701,10 +758,17 @@ if __name__ == "__main__":
         ],
     ]
 
-    cooridnate_weight = 10
+    cooridnate_weight = 5
     no_object_weight = 5
     object_weight = 1
-
+    
+    # Fundamental theory:
+    # Both no_object_loss and object_loss will initially have the same goal of low presence scores
+    # But as the coordinate_loss optimizes the object_loss will eventually want high presence scores to accomodate for coordinate loss
+    # To give the no_obj_loss time to converge we lower coordinate weight so that the object_loss doesn't immediately conflict with no_object_loss
+    # Then object_loss can gradually take over as coordinate_loss converges
+    # Contraction loss also starts to conflict with coordinate_loss when it's too high
+    # So we keep it low to allow coordinate_loss to converge first
     
     inv_freqs = 1.0 / (class_occurences / min(class_occurences))
     alpha = inv_freqs / inv_freqs.sum()
@@ -720,16 +784,17 @@ if __name__ == "__main__":
         addon_layers=addon_layers,
         backprop_layer_indices=backprop_layer_indices,
         loss_function = [
-            YoloLoss(contraction_weight=1e-5, coordinate_loss_function=CIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight * 1, no_object_weight=no_object_weight / 1, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
-            YoloLoss(contraction_weight=1e-5, coordinate_loss_function=CIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight * 2, no_object_weight=no_object_weight / 2, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
-            YoloLoss(contraction_weight=1e-5, coordinate_loss_function=CIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight * 2, no_object_weight=no_object_weight / 100, object_weight=object_weight * 4, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(contraction_weight=1e-5, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight / 1, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(contraction_weight=1e-5, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight / 4 , object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(contraction_weight=1e-5, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight / 16, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
         ],
         # loss_function = YoloLoss(grid_size=grid_size, anchors=anchors, coordinate_weight=5, no_object_weight=no_object_weight, object_weight=1),
-        optimizer = Adam(momentum = 0.8, beta_constant = 0.9, weight_decay=0), 
+        optimizer = Adam(momentum = 0.8, beta_constant = 0.9, weight_decay=1e-5), 
         # optimizer = RMSProp(beta_constant = 0.9),
         # optimizer = Momentum(momentum=0.9),
-        scheduler = StepLR(initial_learning_rate=0.0001, decay_rate=0.5, decay_interval=120), 
-        # scheduler=CosineAnnealingDecay(initial_learning_rate=0.001, min_learning_rate=0.00003, initial_cycle_size=40, cycle_mult=2),
+        scheduler = StepLR(initial_learning_rate=0.00025, decay_rate=0.5, decay_interval=80), 
+        optimize_concats=optimize_concats,
+        # scheduler=CosineAnnealingDecay(initial_learning_rate=0.001, min_learning_rate=0.00003, initial_cycle_size=15, cycle_mult=2),
         # scheduler=ExponentialDecay(initial_learning_rate=0.00007, decay_rate=0.995),
         gpu_mem_frac = 1.0, 
         dtype = dtype
@@ -747,29 +812,64 @@ if __name__ == "__main__":
     titles = ['object_loss', 'no_object_loss', 'coordinate_loss', 'class_loss', 'contraction_loss']
     colors = ['C0', 'C1', 'C2', 'C3', 'C4']
 
-    generator = Generate(batch_size, anchor_dimensions, (image_width, image_height), grid_size, anchors, classes, choices, data_augmentation=True)
-    dataset_size = generator.dataset_size
+    generator = Generate(batch_size, anchor_dimensions, (image_width, image_height), grid_size, anchors, classes, choices, 16, data_augmentation=True)
     
-    queue = multiprocessing.Queue()
+    plt.ion()
+    fig = plt.figure(figsize=(16, 6))
 
-    plot_proc = multiprocessing.Process(
-        target=plot_worker,
-        args=(queue, yolo_head_count, grid_size, batch_size, accumulate, dataset_size, titles, colors)
-    )
-    plot_proc.start()
+    lines = []   # line objects
+    axes = []    # axes for each subplot
 
-    for idx, cost in enumerate(network.fit(generator=generator, batch_size=batch_size, learning_rate=0.05, accumulate=accumulate, epochs = 20000000)):
+    init_plot(yolo_head_count, titles)
+
+    config = {
+        "image_width": int(image_width),
+        "image_height": int(image_height),
+        "grid_size": int(grid_size),
+        "anchors": int(anchors),
+        "anchor_dimensions": anchor_dimensions.tolist(),
+        "classes": int(classes)
+    }
+
+    with open("model-config.json", "w") as json_file:
+        json.dump(config, json_file)
+
+
+    for idx, cost in enumerate(network.fit(generator=generator, batch_size=batch_size, accumulate=accumulate, epochs = 2000000000, gradient_transformer=AutoClipper(5))):
 
         print(cost)
 
-        costs.append(cost)
-        plt.clf()
-
         try:
-           queue.put((idx, cost))
+            cost = np.stack(cost, axis=0)
 
+            if not len(costs):
+                costs = cost[None, ...]
+            else:
+                costs = np.vstack([costs, cost[None, ...]])
+
+            if not idx % 100:
+                steps = costs.shape[0]
+                x_values = np.arange(steps) * (batch_size / (dataset_size * accumulate))
+                print("PREPLOT")
+                live_plot(costs, x_values, yolo_head_count, titles, colors, grid_size)
+                print("POSTPLOT")
+
+                plt.legend()
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+                fig.legend()
+                plt.pause(0.001)
+                print("POST DRAW")
+
+            if not idx % 30 and not np.isnan(cost).any():
+                save()
+
+                print("PASSED SAVE")
         except Exception as e:
-            print(e)
+            now = datetime.now()
+            date_string = now.strftime("%H:%M:%S")
 
-        if not idx % 5 and not np.isnan(cost).any():
-            threading.Thread(target=save).start()
+            print(f"[LOG {date_string}] Iteration: {idx} Error: {e} ")
+
+    else:
+        print("LOOP EXITED")
