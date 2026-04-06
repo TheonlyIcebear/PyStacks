@@ -19,8 +19,9 @@ And I've learned a lot through much trial and error in the Machine Learning fiel
  - I decided to do a complete rewrite allowing my code to be more modular much like keras' `Sequential` class allowing me to quickly add features like `Batch Normalization`
 
 
-Image classification problem training loss:<br>
-![image](https://github.com/user-attachments/assets/b28288b5-8901-4b4f-8299-c2c0b0dfaff8)
+YOLO-v5 Object Detection training loss:<br>
+<img width="1599" height="667" alt="image" src="https://github.com/user-attachments/assets/2858dd63-9c60-4295-a189-b2be1face738" />
+
 
 ## ✨ Features
 
