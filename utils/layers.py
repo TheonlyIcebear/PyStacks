@@ -1,12 +1,11 @@
-import tensorflow.compat.v1 as tf, skimage, scipy, numpy as np, cupy as cp, time, os
-from tensorflow.experimental.dlpack import from_dlpack, to_dlpack
-from utils.functions import Processing
+import tensorflow.compat.v1 as tf, numpy as np, time
+from typing import Optional, Tuple
 from utils.initializers import *
-from utils.loss import *
+import pickle
 
 class Layer:
     def __init__(self):
-        pass
+        self.output_shape: Optional[Tuple[int, int, int, int]] = None
 
     @property
     def size(self):
@@ -32,10 +31,11 @@ class Layer:
         return [], None
 
     def load(self, data, dtype):
-        pass
+        self.dtype = dtype
 
 class Input(Layer):
     def __init__(self, input_shape):
+        super().__init__()
         self.output_shape = np.array(input_shape)
 
     def forward(self, input_activations, training=True):
@@ -55,12 +55,14 @@ class Input(Layer):
 
 class Flatten(Layer):
     def __init__(self):
+        super().__init__()
         pass
 
     def forward(self, input_activations, training=True):
         output_activations = tf.reshape(input_activations, (input_activations.shape[0], -1))
 
-        self.input_shape = input_activations.shape
+        if training:
+            self.input_shape = input_activations.shape
         return output_activations
 
     def backward(self, output_gradient):
@@ -72,12 +74,14 @@ class Flatten(Layer):
 
 class Reshape(Layer):
     def __init__(self, output_shape):
+        super().__init__()
         self.output_shape = output_shape
 
     def forward(self, input_activations, training=True):
         output_activations = tf.reshape(input_activations, self.output_shape)
-
-        self.input_shape = input_activations.shape
+        
+        if training:
+            self.input_shape = input_activations.shape
         return output_activations
 
     def backward(self, output_gradient):
@@ -90,11 +94,15 @@ class Reshape(Layer):
         self.output_shape = np.array(self.output_shape)
         self.dtype = dtype
 
+
 class Conv2d(Layer):
-    def __init__(self, depth, kernel_shape=[3, 3], stride=[1, 1], weight_initializer=HeNormal(), bias_initializer=Fill(0), padding = "VALID"):
-        self.kernel_shape = np.array(kernel_shape)[::-1]
+    def __init__(self, depth, kernel_shape=[3, 3], stride=[1, 1], weight_initializer=HeNormal(), bias_initializer=Fill(0), batch_norm=None, padding = "VALID", activation_function=None):
+        super().__init__()
+        self.kernel_shape = np.array(kernel_shape)
         self.weight_initializer = weight_initializer
         self.bias_initializer = bias_initializer
+        self.activation = Activation(activation_function) if activation_function else None
+        self.batch_norm = batch_norm
         self.depth = depth
 
         if isinstance(stride, int):
@@ -103,34 +111,54 @@ class Conv2d(Layer):
         self.stride = stride
         self.padding = padding
 
+        self.baked = False
+
     @property
     def size(self):
         if not hasattr(self, 'kernels') or not hasattr(self, 'biases'):
             raise AttributeError("Layer needs to be initialized first.")
         
         return (self._size_of(self.kernels) + self._size_of(self.biases))
+    
+    def _bake_parameters(self):
+        if self.batch_norm is not None and not self.baked:
+            scale_vec = tf.cast(self.batch_norm.gamma / tf.sqrt(self.batch_norm.running_var + self.batch_norm.epsilon), self.kernels.dtype)
+            scale = tf.reshape(scale_vec, [1, 1, 1, -1])
+
+            self.kernels.assign(self.kernels * scale)
+            self.biases.assign((self.biases - tf.cast(self.batch_norm.running_mean, self.kernels.dtype)) * scale_vec + tf.cast(self.batch_norm.beta, self.kernels.dtype))
+
+        self.baked = True
 
     def forward(self, input_activations, training=True):
         output_activations = tf.nn.conv2d(
             input_activations, 
             self.kernels, 
-            strides=[1, *self.stride[::-1], 1], 
+            strides=[1, *self.stride, 1], 
             padding=self.padding
         )
 
-        output_activations += self.biases
+        output_activations = tf.nn.bias_add(output_activations, self.biases)
 
         if training:
             self.input_activations = input_activations
 
+        if (self.batch_norm is not None) and not self.baked:
+            output_activations = self.batch_norm.forward(output_activations, training=training)
+
+        if self.activation is not None:
+            output_activations = self.activation.forward(output_activations)
+
         return output_activations
 
     def backward(self, output_gradient):
+        output_gradient, _ = self.activation.backward(output_gradient) if self.activation is not None else (output_gradient, 0)
+        output_gradient, batchnorm_gradients = (self.batch_norm.backward(output_gradient) if self.batch_norm is not None else (output_gradient, []))
         input_gradient = tf.nn.conv2d_backprop_input(
             input_sizes = self.input_activations.shape,
             filters = self.kernels,
             out_backprop = output_gradient,
-            strides = [1, *self.stride[::-1], 1],
+            strides = [1, *self.stride, 1],
             padding = self.padding,
         )
 
@@ -138,7 +166,7 @@ class Conv2d(Layer):
             input = self.input_activations,
             filter_sizes = self.kernels.shape,
             out_backprop = output_gradient,
-            strides = [1, *self.stride[::-1], 1],
+            strides = [1, *self.stride, 1],
             padding = self.padding,
         )
 
@@ -146,6 +174,7 @@ class Conv2d(Layer):
         del self.input_activations
 
         return input_gradient, [
+            batchnorm_gradients,
             kernels_gradient, 
             biases_gradient
         ]
@@ -173,40 +202,68 @@ class Conv2d(Layer):
         if initialize_weights:
             self.kernels = tf.Variable(tf.cast(self.weight_initializer(fan_in, fan_out, (kernel_height, kernel_width, input_channels, output_channels)), dtype=dtype), trainable=True)
             self.biases = tf.Variable(tf.cast(self.bias_initializer(fan_in, fan_out, (output_channels,)), dtype=dtype), trainable=True)
-            
-        self.dtype = dtype
 
+        if self.batch_norm is not None:
+            self.batch_norm.initialize(self.output_shape, initialize_weights=initialize_weights, dtype=dtype)
+
+        self.dtype = dtype
 
     def update(self, optimizer, gradient, descent_values, learning_rate, iteration, apply=True):
         if not apply:
-            return [optimizer.cache_shape, optimizer.cache_shape]
+            batchnorm_cache_shape = self.batch_norm.update(optimizer, gradient, descent_values, learning_rate, iteration, apply=apply) if self.batch_norm is not None else []
+
+            return [batchnorm_cache_shape, optimizer.cache_shape, optimizer.cache_shape]
         
         if not descent_values is None:
-            kernel_descent_values, bias_descent_values = descent_values
+            batchnorm_descent_values, kernel_descent_values, bias_descent_values = descent_values
 
         else:
+            batchnorm_descent_values = None
             kernel_descent_values = None
             bias_descent_values = None
 
-        kernels_gradient, biases_gradient = gradient
+        batchnorm_gradients, kernels_gradient, biases_gradient = gradient
+        
         kernels_gradient = tf.cast(kernels_gradient, dtype=self.kernels.dtype)
         biases_gradient = tf.cast(biases_gradient, dtype=self.biases.dtype)
+
+        if self.batch_norm is not None:
+            new_batchnorm_descent_values = self.batch_norm.update(optimizer, batchnorm_gradients, batchnorm_descent_values, learning_rate, iteration, apply=apply)
+        else:
+            new_batchnorm_descent_values = []
 
         new_kernel_descent_values = optimizer.apply_gradient(self.kernels, kernels_gradient, kernel_descent_values, learning_rate, iteration)
         new_bias_descent_values = optimizer.apply_gradient(self.biases, biases_gradient, bias_descent_values, learning_rate, iteration)
 
-        return [new_kernel_descent_values, new_bias_descent_values]
+        return [new_batchnorm_descent_values, new_kernel_descent_values, new_bias_descent_values]
 
     def save(self):
-        return [self.depth, self.kernel_shape, self.stride, self.weight_initializer, self.bias_initializer, self.padding], [self.kernels, self.biases]
+        return [self.depth, self.kernel_shape, self.stride, self.weight_initializer, self.bias_initializer, None, self.padding, None], [self.kernels.numpy(), self.biases.numpy(), self.batch_norm.save() if self.batch_norm is not None else None if self.batch_norm is not None else None, self.activation.save() if self.activation is not None else None]
 
     def load(self, data, dtype):
-        self.kernels, self.biases = data
+        if len(data) == 4:
+            self.kernels, self.biases, batchnorm_data, activation_data = data
+        else: # Legacy
+            self.kernels, self.biases, batchnorm_data = data
+
         self.kernels = tf.Variable(tf.cast(self.kernels, dtype=dtype), dtype=dtype)
         self.biases = tf.Variable(tf.cast(self.biases, dtype=dtype), dtype=dtype)
 
+        batchnorm_args, batchnorm_data = batchnorm_data if batchnorm_data is not None else (None, None)
+        activation_args, activation_data = activation_data if activation_data is not None else (None, None)
+
+        if batchnorm_data is not None:
+            self.batch_norm = BatchNorm(*batchnorm_args)
+            self.batch_norm.load(batchnorm_data, dtype=dtype)
+
+        if activation_data is not None:
+            self.activation = Activation(*activation_args)
+            self.activation.load(activation_data)
+
+
 class Activation(Layer):
     def __init__(self, activation_function):
+        super().__init__()
         self.activation_function = activation_function
 
     def forward(self, input_activations, training=True):
@@ -217,16 +274,17 @@ class Activation(Layer):
 
         return output_activations
 
-    def backward(self, node_values):
-        new_node_values = node_values * self.activation_function.backward(self.input_activations)
+    def backward(self, output_gradient):
+        input_gradient = output_gradient * self.activation_function.backward(self.input_activations)
         del self.input_activations
-        return new_node_values, tf.constant(0, node_values.dtype)
-
+        return input_gradient, tf.constant(0, output_gradient.dtype)
+    
     def save(self):
         return [self.activation_function], None
 
 class Dense(Layer):
     def __init__(self, depth, weight_initializer=HeNormal(), bias_initializer=Fill(0)):
+        super().__init__()
         self.weight_initializer = weight_initializer
         self.bias_initializer = bias_initializer
         self.depth = np.array(depth)
@@ -290,13 +348,14 @@ class Dense(Layer):
         return new_descent_values
 
     def save(self):
-        return [self.depth, self.weight_initializer, self.bias_initializer], self.layer
+        return [self.depth, self.weight_initializer, self.bias_initializer], self.layer.numpy()
 
     def load(self, data, dtype):
         self.layer = tf.Variable(tf.convert_to_tensor(data, dtype=dtype))
 
 class ConcatBlock(Layer):
     def __init__(self, layers, residual_layers, axis=-1):
+        super().__init__()
         self.layers = layers
         self.residual_layers = residual_layers
         self.axis = axis
@@ -327,9 +386,6 @@ class ConcatBlock(Layer):
 
     def backward(self, output_gradient):
         gradients = [None] * len(self.layers)
-
-        tf.print(self.main_slices, "BRO WHAT")
-        tf.print(self.residual_slices, "BRO WHAT")
 
         begin = [0] * len(output_gradient.shape)
         size = [-1] * len(output_gradient.shape)
@@ -451,6 +507,7 @@ class ConcatBlock(Layer):
 
 class ResidualBlock(Layer):
     def __init__(self, layers):
+        super().__init__()
         self.layers = layers
 
     @property
@@ -497,8 +554,11 @@ class ResidualBlock(Layer):
 
     def update(self, optimizer, gradients, descent_values, learning_rate, iteration, apply=True):
         new_descent_values = []
-        if descent_values is None:
+        if not isinstance(descent_values, list):
             descent_values = [None] * len(self.layers)
+
+        if not apply:
+            gradients = [None] * len(self.layers)
 
         for layer, layer_gradient, descent_value in zip(self.layers, gradients, descent_values):
             new_descent_value = layer.update(optimizer, layer_gradient, descent_value, learning_rate, iteration, apply=apply)
@@ -538,11 +598,13 @@ class ResidualBlock(Layer):
 
 # Concat is intended for generating the other three layers, it should not be used as a layer itself
 class Concat(Layer):
-    def __init__(self, axis=-1):
+    def __init__(self, axis=-1, external_concat=False):
+        super().__init__()
         self.start_point = None
         self.start_res = None
         self.end_point = None
         self.axis = axis
+        self.external_concat = external_concat
     
     def generate_layers(self):
         start_point = ConcatStartPoint(self)
@@ -554,11 +616,13 @@ class Concat(Layer):
 
 class ConcatStartPoint(Concat):
     def __init__(self, parent):
+        super().__init__()
         self.parent = parent
 
     def forward(self, input_activations, training=True):
-        self.parent.start_point.output_activations = input_activations # Store the inputs to be given to the res and main layers
-        return self.parent.start_point.output_activations 
+        if not self.parent.external_concat:
+            self.parent.input_activations = input_activations # Store the inputs to be given to the res and main layers
+            return input_activations
 
     def backward(self, output_gradient):
         output_gradient = output_gradient + self.parent.start_res.output_gradient # Add output_gradient coming from main layer to output_gradient from res layers
@@ -567,21 +631,39 @@ class ConcatStartPoint(Concat):
 
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         self.parent.start_point.output_shape = input_shape
+        self.parent.input_activations = None
+        self.output_shape = input_shape
         self.dtype = dtype
 
     def save(self):
+        for attr in [
+            "output_gradient",
+            "input_activations",
+            "output_activations"
+        ]:
+            if hasattr(self.parent.start_res, attr):
+                delattr(self.parent.start_res, attr)
+            if hasattr(self.parent.end_point, attr):
+                delattr(self.parent.end_point, attr)
+
         return [self.parent], None
 
 class ConcatResidualStartPoint(Concat):
     def __init__(self, parent):
+        super().__init__()
         self.parent = parent
 
     def forward(self, input_activations, training=True):
-        self.parent.start_res.output_activations = input_activations # The outputs from the main layers
-        return self.parent.start_point.output_activations # The same inputs that were given to the start of the main layers
+        if training:
+            self.parent.output_activations_shape = input_activations.shape
+
+        if not self.parent.external_concat:
+            self.parent.output_activations = (input_activations) # The outputs from the main layers
+            return self.parent.input_activations # The same inputs that were given to the start of the main layers
 
     def backward(self, output_gradient):
-        self.parent.start_res.output_gradient = output_gradient
+        if not self.parent.external_concat:
+            self.parent.start_res.output_gradient = output_gradient
 
         slices = [slice(None)] * len(output_gradient.shape)
         slices = list(slices)  # Convert to list to manipulate elements easily
@@ -593,46 +675,82 @@ class ConcatResidualStartPoint(Concat):
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         self.parent.start_res.output_shape = self.parent.start_point.output_shape
         self.parent.start_res.input_shape = input_shape
+        self.output_shape = self.parent.start_res.output_shape
+
         self.dtype = dtype
 
+        self.parent.output_activations = None
+
     def save(self):
+        for attr in [
+            "output_gradient",
+            "input_activations",
+            "output_activations"
+        ]:
+            if hasattr(self.parent.start_res, attr):
+                delattr(self.parent.start_res, attr)
+            if hasattr(self.parent.end_point, attr):
+                delattr(self.parent.end_point, attr)
         return [self.parent], None
 
 class ConcatEndPoint(Concat):
     def __init__(self, parent):
+        super().__init__()
         self.parent = parent
 
     def forward(self, input_activations, training=True):
-        activations = self.parent.start_res.output_activations
-        residual = input_activations
-        output_activations = tf.concat((activations, residual), axis=self.parent.axis)
+        if training:
+            self.parent.end_point.main_activations_depth = self.parent.output_activations_shape[self.parent.axis]
 
-        self.parent.end_point.main_activations_depth = self.parent.start_res.output_activations.shape[self.parent.axis]
-        del self.parent.start_point.output_activations, self.parent.start_res.output_activations
-        return output_activations
+        if not self.parent.external_concat:
+            activations = self.parent.output_activations
+            residual = input_activations
+
+            output_activations = tf.concat((activations, residual), axis=self.parent.axis)
+
+            self.parent.input_activations = None
+            self.parent.output_activations = None
+
+            return output_activations
+        
 
     def backward(self, output_gradient):
-        self.parent.end_point.output_gradient = output_gradient # Save output_gradient for main layers
+        if not self.parent.external_concat:
+            self.parent.end_point.output_gradient = output_gradient # Save output_gradient for main layers
 
         slices = [slice(None)] * len(output_gradient.shape)
         slices = list(slices)  # Convert to list to manipulate elements easily
         slices[self.parent.axis] = slice(self.parent.end_point.main_activations_depth, None)
         slices = tuple(slices)
 
-        return self.parent.end_point.output_gradient[slices], tf.constant(0, output_gradient.dtype) # Pass the output_gradient corresponding to the residual layers
+        return output_gradient[slices], tf.constant(0, output_gradient.dtype) # Pass the output_gradient corresponding to the residual layers
 
     def initialize(self, input_shape, initialize_weights=True, dtype=np.float64):
         self.parent.end_point.output_shape = input_shape
         self.parent.end_point.output_shape[self.parent.axis] += self.parent.start_res.input_shape[self.parent.axis]
+        self.output_shape = self.parent.end_point.output_shape
+
         self.dtype = dtype
 
     def save(self):
+        for attr in [
+            "output_gradient",
+            "input_activations",
+            "output_activations"
+        ]:
+            if hasattr(self.parent.start_res, attr):
+                delattr(self.parent.start_res, attr)
+            if hasattr(self.parent.end_point, attr):
+                delattr(self.parent.end_point, attr)
         return [self.parent], None
+        
 
 class BatchNorm(Layer):
-    def __init__(self, momentum=0.9, epsilon=1e-5):
-        self.momentum = momentum
+    def __init__(self, momentum=0.9, epsilon=1e-5, baked=False):
+        super().__init__()
+        self.momentum = tf.cast(momentum, tf.float32)
         self.epsilon = epsilon
+        self.baked = baked
 
     @property
     def size(self):
@@ -642,43 +760,66 @@ class BatchNorm(Layer):
         return self._size_of(self.gamma) + self._size_of(self.beta) + self._size_of(self.running_mean) + self._size_of(self.running_var)
 
     def forward(self, input_activations, training=True):
-        axes = tf.range(tf.rank(input_activations) - 1)
-
+        input_dtype = input_activations.dtype
+        input_activations = tf.cast(input_activations, tf.float32)
+        
         if training:
+            axes = tf.range(tf.rank(input_activations) - 1)
+                
+            
+
             self.batch_mean = tf.reduce_mean(input_activations, axis=axes)
-            self.batch_var = tf.math.reduce_variance(input_activations, axis=axes)
+            self.batch_var  = tf.math.reduce_variance(input_activations, axis=axes)
 
             x_norm = (input_activations - self.batch_mean) / tf.sqrt(self.batch_var + self.epsilon)
+            x_norm = tf.cast(x_norm, input_activations.dtype)
 
-        else:
-            x_norm = (input_activations - self.running_mean) / (tf.sqrt(self.running_var + self.epsilon))
+            # Update running stats
+            self.running_mean.assign(
+                self.momentum * self.running_mean + (1 - self.momentum) * self.batch_mean
+            )
+            self.running_var.assign(
+                self.momentum * self.running_var + (1 - self.momentum) * self.batch_var
+            )
 
-        output_activations = self.gamma * x_norm + self.beta
+            self.input_activations = tf.cast(input_activations, dtype=input_dtype)
+        
+        elif not training:
+            # Inference path — NO reductions
+            mean = tf.cast(tf.reshape(self.running_mean, [1,1,1,-1]), tf.float32)
+            var  = tf.cast(tf.reshape(self.running_var, [1,1,1,-1]), tf.float32)
+            self.gamma = tf.cast(self.gamma, tf.float32)
+            x_norm = (input_activations - mean) / (tf.sqrt(var + self.epsilon))
 
-        if training:
-            self.input_activations = input_activations
+        output_activations = (self.gamma * x_norm) + tf.cast(self.beta, tf.float32)
 
-        return output_activations
+        return tf.cast(output_activations, dtype=input_dtype)
 
     def backward(self, output_gradient):
-        axes = tf.range(tf.rank(self.input_activations) - 1)
-        stddev_inv = 1 / tf.sqrt(self.batch_var + self.epsilon)
-        x_centered = self.input_activations - self.batch_mean
+
+        input_activations = tf.cast(self.input_activations, output_gradient.dtype)
+        batch_mean = tf.cast(self.batch_mean, output_gradient.dtype)
+        batch_var = tf.cast(self.batch_var, output_gradient.dtype)
+        gamma = tf.cast(self.gamma, output_gradient.dtype)
+
+        axes = tf.range(tf.rank(input_activations) - 1)
+        stddev_inv = 1 / tf.sqrt(batch_var + self.epsilon)
+        x_centered = input_activations - batch_mean
         x_norm = x_centered * stddev_inv
 
-        batch_size = tf.cast(tf.reduce_prod(tf.gather(tf.shape(self.input_activations), axes)), output_gradient.dtype)
+        batch_size = tf.cast(tf.reduce_prod(tf.gather(tf.shape(input_activations), axes)), output_gradient.dtype)
         beta_gradient = tf.reduce_sum(output_gradient, axis=axes)
         gamma_gradient = tf.reduce_sum(output_gradient * x_norm, axis=axes)
-        
-        dx_norm = output_gradient * self.gamma
+
+        dx_norm = tf.cast(output_gradient, gamma.dtype) * gamma
         dx_centered = dx_norm * stddev_inv
         
         dvar = tf.reduce_sum(dx_norm * x_centered * -0.5 * stddev_inv * stddev_inv * stddev_inv, axis=axes, keepdims=True)
-        dmean = tf.reduce_sum(dx_centered * -1.0, axis=axes, keepdims=True) + dvar * tf.reduce_mean(-2.0 * x_centered, axis=axes, keepdims=True)
+        dmean = tf.reduce_sum(dx_centered * -1.0, axis=axes, keepdims=True) + dvar * tf.reduce_sum(-2.0 * x_centered, axis=axes, keepdims=True) / batch_size
         
         input_gradient = dx_centered + dvar * 2.0 * x_centered / batch_size + dmean / batch_size
-        
-        del self.input_activations
+
+        input_gradient = tf.cast(input_gradient, output_gradient.dtype)
         
         return input_gradient, [gamma_gradient, beta_gradient]
 
@@ -688,6 +829,9 @@ class BatchNorm(Layer):
         
         if descent_values is not None:
             gamma_descent_values, beta_descent_values = descent_values
+            gamma_descent_values = tf.cast(gamma_descent_values, dtype=self.gamma.dtype)
+            beta_descent_values = tf.cast(beta_descent_values, dtype=self.beta.dtype)
+            
         else:
             gamma_descent_values = None
             beta_descent_values = None
@@ -697,13 +841,11 @@ class BatchNorm(Layer):
         dgamma = tf.cast(dgamma, dtype=self.gamma.dtype)
         dbeta = tf.cast(dbeta, dtype=self.beta.dtype)
 
-        
-
-        self.running_mean.assign((self.momentum * self.running_mean + (1 - self.momentum) * self.batch_mean))
-        self.running_var.assign((self.momentum * self.running_var + (1 - self.momentum) * self.batch_var))
-
         new_gamma_descent_values = optimizer.apply_gradient(self.gamma, dgamma, gamma_descent_values, learning_rate, iteration)
         new_beta_descent_values = optimizer.apply_gradient(self.beta, dbeta, beta_descent_values, learning_rate, iteration)
+        
+        new_gamma_descent_values = [tf.cast(value, self.dtype) if value is not None else None for value in new_gamma_descent_values]
+        new_beta_descent_values = [tf.cast(value, self.dtype) if value is not None else None for value in new_beta_descent_values]
 
         return [new_gamma_descent_values, new_beta_descent_values]
 
@@ -716,16 +858,16 @@ class BatchNorm(Layer):
             features = input_shape
 
         if initialize_weights:
-            self.gamma = tf.Variable(tf.ones((features,), dtype=dtype), trainable=True)
-            self.beta = tf.Variable(tf.zeros((features,), dtype=dtype), trainable=True)
-            self.running_mean = tf.Variable(tf.zeros((features,), dtype=dtype), trainable=True)
-            self.running_var = tf.Variable(tf.ones((features,), dtype=dtype), trainable=True)
+            self.gamma = tf.Variable(tf.ones((features,), dtype=tf.float32), trainable=True)
+            self.beta = tf.Variable(tf.zeros((features,), dtype=tf.float32), trainable=True)
+            self.running_mean = tf.Variable(tf.zeros((features,), dtype=tf.float32), trainable=True)
+            self.running_var = tf.Variable(tf.ones((features,), dtype=tf.float32), trainable=True)
 
         self.output_shape = input_shape
-        self.dtype = dtype
+        self.dtype = dtype # BatchNorm is always float32 for stability
 
     def save(self):
-        return [self.momentum], [self.gamma, self.beta, self.running_mean, self.running_var]
+        return [self.momentum.numpy(), self.epsilon, self.baked], [self.gamma.numpy(), self.beta.numpy(), self.running_mean.numpy(), self.running_var.numpy()]
 
     def load(self, data, dtype):
         self.gamma, self.beta, self.running_mean, self.running_var = data
@@ -736,6 +878,7 @@ class BatchNorm(Layer):
 
 class Space2Depth(Layer):
     def __init__(self, block_size):
+        super().__init__()
         self.block_size = block_size
 
     def forward(self, input_activations, training=True):
@@ -763,6 +906,7 @@ class Space2Depth(Layer):
 
 class Depth2Space(Layer):
     def __init__(self, block_size):
+        super().__init__()
         self.block_size = block_size
 
     def forward(self, input_activations, training=True):
@@ -790,6 +934,7 @@ class Depth2Space(Layer):
 
 class Upsample(Layer):
     def __init__(self, scale_factor, method="nearest"):
+        super().__init__()
         self.scale_factor = scale_factor
         self.method = method
 
@@ -833,6 +978,7 @@ class Upsample(Layer):
 
 class MaxPool(Layer):
     def __init__(self, pooling_shape = [2, 2], pooling_stride = None, padding="SAME"):
+        super().__init__()
         self.pooling_shape = pooling_shape
 
         if not pooling_stride:
@@ -843,16 +989,25 @@ class MaxPool(Layer):
         self.padding = padding
 
     def forward(self, input_activations, training=True):
-        output_activations, argmax = tf.nn.max_pool_with_argmax(
-            input_activations,
-            [1, *self.pooling_shape[::-1], 1],
-            [1, *self.pooling_stride[::-1], 1],
-            self.padding
-        )
-
         if training:
+            output_activations, argmax = tf.nn.max_pool_with_argmax(
+                input_activations,
+                [1, *self.pooling_shape, 1],
+                [1, *self.pooling_stride, 1],
+                self.padding
+            )
+            
             self.pooling_indices = argmax
             self.input_shape = tf.shape(input_activations)
+
+        else:
+            # input_activations = tf.reshape(input_activations, [-1, *input_activations.shape[-3:]])
+            output_activations = tf.nn.max_pool(
+                input_activations,
+                [1, *self.pooling_shape, 1],
+                [1, *self.pooling_stride, 1],
+                self.padding
+            )
 
         return output_activations
 
@@ -893,6 +1048,7 @@ class MaxPool(Layer):
 
 class Dropout(Layer):
     def __init__(self, dropout_rate=0.5):
+        super().__init__()
         self.dropout_rate = dropout_rate
         
     def forward(self, input_activations, training=True):

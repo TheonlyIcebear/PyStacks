@@ -9,9 +9,9 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-import tensorflow.compat.v1 as tf
+import tensorflow.compat.v1 as tf, cupy as cp
 
-gpu_mem_frac = 0.99  # Fraction of GPU memory to use
+gpu_mem_frac = 1  # Fraction of GPU memory to use
 
 physical_gpus = tf.config.experimental.list_physical_devices('GPU')
 
@@ -35,12 +35,14 @@ else:
     raise RuntimeError("Must have atleast one CUDA compatible GPU")
 
 class Network:
-    def __init__(self, model=[], backprop_layer_indices=[-1], addon_layers=[], loss_function=MSE(), optimizer=SGD(), gpu_mem_frac=1, dtype=np.float64, scheduler=None):
+    def __init__(self, model=[], backprop_layer_indices=[-1], addon_layers=[], loss_function=MSE(), optimizer=SGD(), gpu_mem_frac=1, dtype=np.float64, scheduler=None, optimize_concats=True):
         self.model = model
         self.loss_functions = loss_function if isinstance(loss_function, list) else [loss_function] * len(backprop_layer_indices)
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.dtype = dtype
+
+        self.optimize_concats = optimize_concats
 
         self.backprop_layer_indices = sorted(backprop_layer_indices)
         self.addon_layers = addon_layers
@@ -48,6 +50,13 @@ class Network:
         self.learning_rate = None
         self.starting_epoch = 0
         self.epoch = 0
+
+        self.optimizer_values = None
+        self.addon_optimizer_values = None
+
+        self.accumulated_gradient = None
+        self.accumulated_addon_gradient = None
+
 
     @property
     def size(self):
@@ -61,14 +70,15 @@ class Network:
 
         return total_size
 
-    def compile(self):
+
+    def compile(self, training=False, initialize_weights=True):
         input_shape = self.model[0].output_shape.copy()
 
         print(input_shape)
 
         with tf.device('/GPU:0'):
             for idx, layer in enumerate(self.model):
-                layer.initialize(input_shape, dtype=self.dtype)
+                layer.initialize(input_shape, initialize_weights=initialize_weights, dtype=self.dtype)
                 input_shape = layer.output_shape.copy()
 
                 print(layer, input_shape)
@@ -85,7 +95,7 @@ class Network:
                         _input_shape = input_shape.copy()
 
                         for layer in self.addon_layers[index]:
-                            layer.initialize(_input_shape, dtype=self.dtype)
+                            layer.initialize(_input_shape, initialize_weights=initialize_weights, dtype=self.dtype)
                             _input_shape = layer.output_shape.copy()
 
                             print(layer, _input_shape, "ADDON")
@@ -120,23 +130,17 @@ class Network:
                     addon_data.append(list(layer.save()) + [layer.__class__.__name__])
 
                 combined_addon_data.append(addon_data)
-
+                
             return (
-                model_data, combined_addon_data, 
-                self.backprop_layer_indices, self.loss_functions, self.scheduler, 
-                self.learning_rate, self.epoch, self.dtype
+                model_data, combined_addon_data,
+                self.loss_functions, self.dtype
             )
 
-    def load(self, save_data, new_dtype=None):
-        input_shape = None
+    def load(self, save_data, new_dtype=None, training=False):
 
-        model_data, combined_addon_data, backprop_layer_indices, loss_functions, scheduler, learning_rate, starting_epoch, dtype = save_data
+        model_data, combined_addon_data, loss_functions, dtype = save_data
 
-        self.backprop_layer_indices = backprop_layer_indices
-        self.starting_epoch = starting_epoch
         self.loss_functions = loss_functions
-        self.learning_rate = learning_rate
-        self.scheduler = scheduler
         self.dtype = dtype if not new_dtype else new_dtype
 
         with tf.device('/GPU:0'):
@@ -147,7 +151,9 @@ class Network:
                 layer = layer_class(*layer_args)
 
                 layer.load(layer_data, self.dtype)
-
+                if isinstance(layer, utils.layers.Conv2d) and not training:
+                    layer._bake_parameters()
+                    
                 model.append(layer)
 
             addon_layers = []
@@ -159,6 +165,8 @@ class Network:
                     layer = layer_class(*layer_args)
 
                     layer.load(layer_data, self.dtype)
+                    if isinstance(layer, utils.layers.Conv2d) and not training:
+                        layer._bake_parameters()
 
                     layers.append(layer)
 
@@ -167,16 +175,38 @@ class Network:
         self.model = model
         self.addon_layers = addon_layers
     
-    def forward(self, activations, training=True):
+    def forward(self, activations, training=False):
         outputs = []
+        paths = {}
         
         with tf.device('/GPU:0'):
             for idx, layer in enumerate(self.model):
-                time1 = time.perf_counter()
-                activations = layer.forward(activations, training=training)
-                time2 = time.perf_counter()
+
+                
+                
+                if self.optimize_concats and isinstance(layer, (
+                    utils.layers.ConcatStartPoint,
+                    utils.layers.ConcatResidualStartPoint,
+                    utils.layers.ConcatEndPoint
+                )):
+                    layer.forward(activations, training=training)
+                    if isinstance(layer, utils.layers.ConcatStartPoint):
+                        paths[id(layer.parent)] = activations
+
+                    elif isinstance(layer, utils.layers.ConcatResidualStartPoint):
+                        activations, paths[id(layer.parent)] = paths[id(layer.parent)], activations
+
+                    elif isinstance(layer, utils.layers.ConcatEndPoint):
+                        activations = tf.concat((activations, paths[id(layer.parent)]), axis=layer.parent.axis)
+
+                    
+                
+                else:
+                    activations = layer.forward(activations, training=training)
 
                 negative_index = idx - len(self.model)
+
+                
 
                 if (idx in self.backprop_layer_indices) or (negative_index in self.backprop_layer_indices):
                     _activations = activations
@@ -188,7 +218,26 @@ class Network:
                             index = self.backprop_layer_indices.index(negative_index)
 
                         for layer in self.addon_layers[index]:
-                            _activations = layer.forward(_activations, training=training)
+
+                            if self.optimize_concats and isinstance(layer, (
+                                utils.layers.ConcatStartPoint,
+                                utils.layers.ConcatResidualStartPoint,
+                                utils.layers.ConcatEndPoint
+                            )):
+                                layer.forward(_activations, training=training)
+                                if isinstance(layer, utils.layers.ConcatStartPoint):
+                                    paths[id(layer.parent)] = _activations
+
+                                elif isinstance(layer, utils.layers.ConcatResidualStartPoint):
+                                    _activations, paths[id(layer.parent)] = paths[id(layer.parent)], _activations
+
+                                elif isinstance(layer, utils.layers.ConcatEndPoint):
+                                    _activations = tf.concat((_activations, paths[id(layer.parent)]), axis=layer.parent.axis)
+
+                                
+                            
+                            else:
+                                _activations = layer.forward(_activations, training=training)
 
                     outputs.append(_activations)
 
@@ -197,7 +246,6 @@ class Network:
         return outputs
 
     def cost_gradient(self, outputs, expected_outputs, loss_function):
-        costs = []
         node_values = []
 
         outputs = tf.cast(outputs, dtype=self.dtype)
@@ -222,6 +270,7 @@ class Network:
         gradients = [None] * (len(self.model) - 1) 
         addon_gradients = [None] * len(self.addon_layers)
         costs = []
+        paths = {}
 
         with tf.device('/GPU:0'):
             for idx, layer in enumerate(self.model[::-1][:-1]):
@@ -239,7 +288,11 @@ class Network:
 
                     output = outputs[addon_index]
 
-                    indexed_expected_outputs = tf.gather(expected_outputs, addon_index, axis=1)
+                    if tf.is_tensor(expected_outputs[0]):
+                        indexed_expected_outputs = tf.gather(expected_outputs, addon_index, axis=1)
+
+                    else:
+                        indexed_expected_outputs = [output[addon_index] for output in expected_outputs]
 
                     cost, _node_values = self.cost_gradient(output, indexed_expected_outputs, self.loss_functions[addon_index])
                     costs.append(cost)
@@ -251,8 +304,34 @@ class Network:
                         for idx, addon_layer in enumerate(self.addon_layers[addon_index][::-1]):
                             current_layer_addon_index = -(idx + 1)
 
-                            _node_values, gradient = addon_layer.backward(_node_values)
+                            if self.optimize_concats and isinstance(addon_layer, (
+                                utils.layers.ConcatStartPoint,
+                                utils.layers.ConcatResidualStartPoint,
+                                utils.layers.ConcatEndPoint
+                            )):
+                                if isinstance(addon_layer, utils.layers.ConcatStartPoint):
+                                    _node_values = _node_values + paths[id(addon_layer.parent)]
+                                    gradient = tf.constant(0, _node_values.dtype)
+
+                                elif isinstance(addon_layer, utils.layers.ConcatResidualStartPoint):
+                                    slices = [slice(None)] * len(_node_values.shape)
+                                    slices = list(slices)  # Convert to list to manipulate elements easily
+                                    slices[layer.parent.axis] = slice(None, layer.parent.end_point.main_activations_depth)
+                                    slices = tuple(slices)
+
+
+                                    _node_values, paths[id(addon_layer.parent)] = paths[id(addon_layer.parent)][slices], _node_values
+                                    gradient = tf.constant(0, _node_values.dtype)
+                                    
+                                elif isinstance(addon_layer, utils.layers.ConcatEndPoint):
+                                    paths[id(addon_layer.parent)] = _node_values
+                                    _node_values, gradient = addon_layer.backward(_node_values)
+
+                            else:
+                                _node_values, gradient = addon_layer.backward(_node_values)
+
                             addon_gradient[current_layer_addon_index] = gradient
+
                         addon_gradients[addon_index] = addon_gradient
                         
                         del addon_gradient
@@ -267,12 +346,35 @@ class Network:
                 if node_values is None:
                     continue
 
-                node_values, gradient = layer.backward(node_values)
+                if self.optimize_concats and isinstance(layer, (
+                    utils.layers.ConcatStartPoint,
+                    utils.layers.ConcatResidualStartPoint,
+                    utils.layers.ConcatEndPoint
+                )):
+                    if isinstance(layer, utils.layers.ConcatStartPoint):
+                        node_values = node_values + paths[id(layer.parent)]
+                        gradient = tf.constant(0, node_values.dtype)
+
+                    elif isinstance(layer, utils.layers.ConcatResidualStartPoint):
+                        slices = [slice(None)] * len(node_values.shape)
+                        slices = list(slices)  # Convert to list to manipulate elements easily
+                        slices[layer.parent.axis] = slice(None, layer.parent.end_point.main_activations_depth)
+                        slices = tuple(slices)
+
+
+                        node_values, paths[id(layer.parent)] = paths[id(layer.parent)][slices], node_values
+                        gradient = tf.constant(0, node_values.dtype)
+                        
+                    elif isinstance(layer, utils.layers.ConcatEndPoint):
+                        paths[id(layer.parent)] = node_values
+                        node_values, gradient = layer.backward(node_values)
+
+                else:
+                    node_values, gradient = layer.backward(node_values)
+
                 gradients[current_layer_index] = gradient
 
                 time2 = time.perf_counter()
-
-                del gradient
 
         return tuple(gradients), tuple(addon_gradients), costs[::-1]
 
@@ -282,33 +384,6 @@ class Network:
 
     def _scale_gradient(self, gradient, scale):
         return list(tf.nest.map_structure(lambda g: g / scale if g is not None else None, gradient))
-
-    # def _numpify_values(self, values):
-    #     for idx, layer in enumerate(values):
-    #         if not isinstance(layer, (list, tuple, type(None))):
-    #             if len(layer) == 0:
-    #                 values[idx] = np.array([])
-    #             values[idx] = layer.numpy()
-    #         else:
-    #             if layer is None:
-    #                 continue
-    #             values[idx] = self._numpify_values(layer)
-
-    #     return values
-
-    def _cupify_values(self, values):
-        values = values[:]
-        for idx, layer in enumerate(values):
-            if isinstance(layer, np.ndarray):
-                if layer.size == 0:
-                    values[idx] = cp.array([])
-                values[idx] = cp.array(layer)
-            else:
-                if layer is None:
-                    continue
-                values[idx] = self._cupify_values(layer)
-
-        return values
     
     def _tensorify_values(self, values, dtype):
         if tf.is_tensor(values):
@@ -338,7 +413,7 @@ class Network:
     
     @tf.function(reduce_retracing=True)
     def _train_step(self, selected_xdata, selected_ydata, accumulated_gradient, accumulated_addon_gradient, optimizer_values, addon_optimizer_values, accumulate, gradient_transformer, iteration, learning_rate):
-        outputs = self.forward(selected_xdata)
+        outputs = self.forward(selected_xdata, training=True)
         gradient, addon_gradients, cost = self.backward(outputs, selected_ydata)
 
         iteration = tf.cast(iteration, self.dtype)
@@ -348,16 +423,18 @@ class Network:
         addon_gradients = list(addon_gradients)
 
         del selected_xdata, selected_ydata
+        
+        if accumulate > 1:
+            if len(accumulated_gradient) == 0:
+                accumulated_gradient = gradient
+                accumulated_addon_gradient = addon_gradients
+            else:
+                accumulated_gradient = self._sum_gradients([accumulated_gradient, gradient])
+                accumulated_addon_gradient = self._sum_gradients([accumulated_addon_gradient, addon_gradients])
 
-        if not accumulated_gradient:
+        else:
             accumulated_gradient = gradient
             accumulated_addon_gradient = addon_gradients
-        else:
-            accumulated_gradient = self._sum_gradients([accumulated_gradient, gradient])
-            accumulated_addon_gradient = self._sum_gradients([accumulated_addon_gradient, addon_gradients])
-
-        accumulated_gradient = accumulated_gradient
-        accumulated_addon_gradient = accumulated_addon_gradient
 
         # Update step
         if tf.equal(tf.math.floormod(int(iteration) + 1, accumulate), 0):
@@ -370,7 +447,6 @@ class Network:
             accumulated_gradient = self._zero_grad(gradient, self.dtype)
             accumulated_addon_gradient = self._zero_grad(addon_gradients, self.dtype)
 
-            start_time2 = time.perf_counter()
 
             if accumulate > 1:
                 gradient = self._scale_gradient(transformed_accumulated_gradient, accumulate)
@@ -385,10 +461,6 @@ class Network:
                     new_descent_values = layer.update(self.optimizer, layer_gradient, descent_values, learning_rate, iteration)
 
                     _addon_optimizer_values[addon_index][idx] = new_descent_values
-                    del new_descent_values
-
-            if self.addon_layers:
-                del addon_gradients
 
             for idx, (layer, layer_gradient, descent_values) in enumerate(zip(self.model[1:], gradient, optimizer_values)):
                 if layer_gradient is None:
@@ -397,8 +469,6 @@ class Network:
                 new_descent_values = layer.update(self.optimizer, layer_gradient, descent_values, learning_rate, iteration)
 
                 _optimizer_values[idx] = new_descent_values
-
-            end_time2 = time.perf_counter()
 
         else:
             _optimizer_values = optimizer_values
@@ -432,8 +502,15 @@ class Network:
         cost = None
         delay = None
 
-        optimizer_values = [tf.constant(0, self.dtype)] * len(self.model)
-        addon_optimizer_values = [[tf.constant(0, self.dtype)] * len(layers) for layers in self.addon_layers]
+        if not self.optimizer_values:
+            optimizer_values = [tf.constant(0, self.dtype)] * len(self.model)
+        else:
+            optimizer_values = self.optimizer_values
+
+        if not self.addon_optimizer_values:
+            addon_optimizer_values = [[tf.constant(0, self.dtype)] * len(layers) for layers in self.addon_layers]
+        else:
+            addon_optimizer_values = self.addon_optimizer_values
 
         for addon_index, (addon_layers, addon_optimizer_value) in enumerate(zip(self.addon_layers, addon_optimizer_values)):
             for idx, (layer, descent_values) in enumerate(zip(addon_layers, addon_optimizer_value)):
@@ -443,28 +520,34 @@ class Network:
                 addon_optimizer_values[addon_index][idx] = new_descent_values
                 del new_descent_values
 
-        if self.addon_layers:
-            del addon_gradients
-
         for idx, (layer, descent_values) in enumerate(zip(self.model[1:], optimizer_values)):
 
             new_descent_values = self._tensorify_values(layer.update(self.optimizer, None, descent_values, learning_rate, 0, apply=False), dtype=self.dtype)
 
             optimizer_values[idx] = new_descent_values
 
-        accumulated_gradient = None
-        accumulated_addon_gradient = None
+        if not self.accumulated_gradient:
+            accumulated_gradient = []
+        else:
+            accumulated_gradient = self.accumulated_gradient
+
+        if not self.accumulated_addon_gradient:
+            accumulated_addon_gradient = []
+        else:
+            accumulated_addon_gradient = self.accumulated_addon_gradient
 
         for iteration in range(iterations):
             start_time = time.perf_counter()
 
-            epoch = self.starting_epoch + (batch_size / dataset_size) * iteration
+            epoch = self.starting_epoch + (batch_size / (dataset_size * accumulate)) * iteration
 
             self.epoch = epoch
             self.learning_rate = learning_rate
 
             if self.scheduler:
                 learning_rate = tf.constant(self.scheduler(epoch), dtype=self.dtype)
+
+            start_time2 = time.perf_counter()
 
             if not generator:
                 choices = np.random.choice(xdata.shape[0], size=batch_size, replace=False)
@@ -477,15 +560,27 @@ class Network:
                 selected_xdata = selected_xdata.astype(self.dtype)
                 selected_ydata = selected_ydata
             
-            accumulated_gradient, accumulated_addon_gradient, optimizer_values, addon_optimizer_values, cost = self._train_step(selected_xdata, selected_ydata, accumulated_gradient, accumulated_addon_gradient, optimizer_values, addon_optimizer_values, accumulate, gradient_transformer, tf.constant(iteration, dtype=self.dtype), tf.constant(learning_rate, dtype=self.dtype))
-            del selected_xdata, selected_ydata
+            end_time2 = time.perf_counter()
+            delay = end_time2 - start_time2
+            print(f"[LOG] Data Selection Delay: {delay}")
+            
+            try:
+                accumulated_gradient, accumulated_addon_gradient, optimizer_values, addon_optimizer_values, cost = self._train_step(selected_xdata, selected_ydata, accumulated_gradient, accumulated_addon_gradient, optimizer_values, addon_optimizer_values, accumulate, gradient_transformer, tf.constant(iteration, dtype=self.dtype), tf.constant(learning_rate, dtype=self.dtype))
+            except Exception as e:
+                print(e)
+                continue
+
+            self.optimizer_values = optimizer_values
+            self.addon_optimizer_values = addon_optimizer_values
+            self.accumulated_gradient = accumulated_gradient
+            self.accumulated_addon_gradient = accumulated_addon_gradient
 
             end_time = time.perf_counter()
             delay = end_time - start_time
 
             now = datetime.now()
             date_string = now.strftime("%H:%M:%S")
-
+            
             print(f"[LOG {date_string}] Iteration: {iteration}, Epoch: {epoch}, Delay: {delay}, Learning Rate: {learning_rate}")
             end_time = time.perf_counter()
 

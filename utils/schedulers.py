@@ -1,4 +1,4 @@
-import numpy as np, cupy as cp
+import numpy as np
 
 class StepLR:
     def __init__(self, initial_learning_rate, decay_rate, decay_interval=1):

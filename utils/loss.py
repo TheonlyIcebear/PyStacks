@@ -1,10 +1,5 @@
-from functools import partial
-import tensorflow.compat.v1 as tf
-import numpy as np, cupy as cp, time
-from PIL import Image, ImageTk, ImageDraw
+import tensorflow.compat.v1 as tf, numpy as np
 from utils.functions import Processing
-from utils.activations import Sigmoid
-from tensorflow.experimental.dlpack import from_dlpack, to_dlpack
 
 class CrossEntropy:
     def __init__(self):
@@ -144,7 +139,7 @@ class SIoU:
 class CIoU:
     @staticmethod
     def forward(outputs, target_outputs):
-        eps = 1e-6
+        eps = 1e-5
         dtype = outputs.dtype
         outputs = tf.cast(tf.reshape(outputs, [-1, 4]), tf.float64)
         target_outputs = tf.cast(tf.reshape(target_outputs, [-1, 4]), tf.float64)
@@ -240,7 +235,7 @@ class DIoU:
         
 
 class YoloLoss:
-    def __init__(self, grid_size=13, anchors=5, classes=2, coordinate_weight=5, class_weight=0.5, no_object_weight=0.5, object_weight=1, contraction_weight=1e-6, contraction_decay_rate=0.99, coordinate_loss_function=MSE, objectness_loss_function=MSE, class_loss_function=BCE, anchor_dimensions=None, dtype=tf.float64):
+    def __init__(self, grid_size=13, anchors=5, classes=2, coordinate_weight=5, class_weight=0.5, no_object_weight=0.5, object_weight=1, contraction_weight=1e-6, contraction_decay_rate=0.9, coordinate_loss_function=MSE, objectness_loss_function=MSE, class_loss_function=BCE, anchor_dimensions=None, dtype=tf.float64):
         self.objectness_loss_function = objectness_loss_function
         self.coordinate_loss_function = coordinate_loss_function
         self.class_loss_function = class_loss_function
@@ -273,26 +268,25 @@ class YoloLoss:
         no_object_weight = tf.cast(self.no_object_weight, dtype)
         object_weight = tf.cast(self.object_weight, dtype)
         class_weight = tf.cast(self.class_weight, dtype)
-        anchors = tf.cast(self.anchors, dtype)
-        classes = tf.cast(self.classes, dtype)
+        anchors = tf.cast(self.anchors, tf.int32)
+        classes = tf.cast(self.classes, tf.int32)
 
         batch_size = outputs.shape[0]
         grid_size = tf.sqrt(tf.reduce_prod(outputs.shape[1:]) / tf.cast(anchors * (5 + classes), tf.int32))
         grid_size = tf.cast(tf.floor(grid_size), dtype)
 
-        scale_idx = tf.math.log(grid_size / tf.cast(self.grid_size, dtype)) / tf.math.log(tf.constant(2.0, dtype=dtype))
+        scale_idx = tf.cast(tf.math.log(grid_size / tf.cast(self.grid_size, dtype)) / tf.math.log(tf.constant(2.0, dtype=dtype)), tf.int32)
 
         # Shape: (anchors, 2)
-        scale_anchor_wh = tf.convert_to_tensor(
-            anchor_dimensions[int(scale_idx * anchors): int((scale_idx + 1) * anchors)],
-            dtype=dtype,
-        )
+        start = scale_idx * anchors
+        scale_anchor_wh = tf.gather(anchor_dimensions, tf.range(start, start + anchors))
 
         presence_scores = tf.reshape(outputs, (batch_size, -1))[..., ::int(5 + classes)]
         target_presence_scores = tf.reshape(target_outputs, (batch_size, -1))[..., ::int(5 + classes)]
 
-        inactive_mask = tf.equal(target_presence_scores, 0)
-        active_mask = tf.equal(target_presence_scores, 1)
+        # Uses inequality to account for float percision
+        inactive_mask = target_presence_scores < 0.5
+        active_mask = target_presence_scores >= 0.5
 
         inactive_presence = tf.boolean_mask(presence_scores, inactive_mask)
         target_inactive_presence = tf.boolean_mask(target_presence_scores, inactive_mask)
@@ -300,12 +294,13 @@ class YoloLoss:
         active_presence = tf.boolean_mask(presence_scores, active_mask)
         target_active_presence = tf.boolean_mask(target_presence_scores, active_mask)
 
-        grid_count = int(tf.ceil(grid_size ** 2))
+        grid_count = tf.cast(tf.ceil(grid_size ** 2), tf.int32)
 
         # Remove presence score
         boxes = tf.reshape(outputs, (batch_size, grid_count * anchors, 5 + classes))[..., 1:]
         target_boxes = tf.reshape(target_outputs, (batch_size, grid_count * anchors, 5 + classes))[..., 1:]
-
+        
+        grid_count = tf.cast(grid_count, tf.int32)
         idxs = tf.cast(tf.range(grid_count * anchors), dtype=tf.int32)
 
         grid_x = (idxs // tf.cast(anchors, dtype=tf.int32)) % tf.cast(grid_size, dtype=tf.int32)
@@ -329,9 +324,6 @@ class YoloLoss:
         scaled_wh = tf.reshape(scaled_wh, (batch_size, grid_count * anchors, 2))
         scaled_target_wh = tf.reshape(scaled_target_wh, (batch_size, grid_count * anchors, 2))
 
-        del reshaped_target_boxes
-
-
         # Concatenate offsets with wh
         active_boxes = tf.concat([
             tf.boolean_mask(scaled_xy, active_mask), 
@@ -350,14 +342,9 @@ class YoloLoss:
         inactive_boxes_wh = tf.boolean_mask(scaled_wh, inactive_mask)
         inactive_boxes_xy = tf.boolean_mask(scaled_xy, inactive_mask)
 
-        del scaled_xy, scaled_wh
-        del scaled_target_xy, scaled_target_wh
-
         inactive_boxes = tf.concat([inactive_boxes_xy, inactive_boxes_wh], axis=-1)
         # Set target x and y offsets to what was predicted so there is only a penalty for the wh
         inactive_target_boxes = tf.concat([reshaped_boxes, tf.repeat(scale_anchor_wh[None, :, :], reshaped_boxes.shape[0], axis=0)], axis=-1)  # Join predicted offsets with anchor box dimensions
-
-        del reshaped_boxes, boxes
 
         inactive_target_boxes = tf.reshape(inactive_target_boxes, (batch_size, grid_count * anchors, 4))
         inactive_target_boxes = tf.stop_gradient(
@@ -367,22 +354,12 @@ class YoloLoss:
         # ious = 1 - tf.stop_gradient(self.coordinate_loss_function.forward(active_boxes, active_target_boxes)) / 2
         ious = tf.stop_gradient(tf.linalg.diag_part(Processing.iou(active_boxes, active_target_boxes, api=tf)))
 
-        print(tf.reduce_mean(active_boxes[..., 2:4], axis=tuple(range(active_boxes.shape.ndims - 1))), "predicted wh")
-        print(tf.reduce_mean(active_target_boxes[..., 2:4], axis=tuple(range(active_boxes.shape.ndims - 1))), "target wh")
-
-
-        print(float(tf.reduce_mean(active_presence)), "predicted ious")
-        print(float(tf.reduce_mean(ious)), scale_idx, "target ious")
-
-
         # Define class predictions and target class predictions
         reshaped_classes = tf.reshape(outputs[..., 5:], (batch_size, grid_count * anchors, classes))
         reshaped_target_classes = tf.reshape(target_outputs[..., 5:], (batch_size, grid_count * anchors, classes))
 
         active_class = tf.boolean_mask(reshaped_classes, active_mask)
         target_active_class = tf.boolean_mask(reshaped_target_classes, active_mask)
-
-        del reshaped_classes, reshaped_target_classes
 
         # Compute losses
         coordinate_loss = tf.reduce_mean(
@@ -391,7 +368,6 @@ class YoloLoss:
             active_target_boxes
             )
         ) * coordinate_weight
-        del active_boxes, active_target_boxes
 
         contraction_loss = tf.reduce_mean(
             self.coordinate_loss_function.forward(
@@ -399,25 +375,21 @@ class YoloLoss:
             inactive_target_boxes
             )
         ) * contraction_weight
-        del inactive_boxes, inactive_target_boxes
 
         no_object_loss = self.objectness_loss_function.forward(
             inactive_presence,
             target_inactive_presence
         ) * no_object_weight
-        del inactive_presence, target_inactive_presence
 
         object_loss = self.objectness_loss_function.forward(
             active_presence,
             target_active_presence * ious
         ) * object_weight
-        del active_presence, target_active_presence, ious
 
         class_loss = self.class_loss_function.forward(
             active_class,
             target_active_class
         ) * class_weight
-        del active_class, target_active_class
 
         # Cast losses back to original dtype for stability
         coordinate_loss = tf.cast(coordinate_loss, orig_dtype)

@@ -1,12 +1,8 @@
-from functools import partial
-import numpy as np, cupy as cp, time
 import tensorflow as tf
-from tensorflow.experimental.dlpack import from_dlpack, to_dlpack
 import tensorflow_probability as tfp
-from PIL import Image, ImageTk, ImageDraw
 
 class Processing:
-    def iou(boxes1, boxes2, api=cp):
+    def iou(boxes1, boxes2, api=tf):
         boxes1_top_left = (boxes1[..., :2] - (boxes1[..., 2:] / 2))
         boxes1_bottom_right = (boxes1[..., :2] + (boxes1[..., 2:] / 2))
 
@@ -19,8 +15,8 @@ class Processing:
         bottom_right_x = api.minimum(boxes1_bottom_right[..., 0:1], boxes2_bottom_right[..., 0])
         bottom_right_y = api.minimum(boxes1_bottom_right[..., 1:2], boxes2_bottom_right[..., 1])
 
-        intersection_width = api.maximum(0.0, bottom_right_x - top_left_x)
-        intersection_height = api.maximum(0.0, bottom_right_y - top_left_y)
+        intersection_width = api.maximum(tf.constant(0.0, dtype=boxes1.dtype), bottom_right_x - top_left_x)
+        intersection_height = api.maximum(tf.constant(0.0, dtype=boxes1.dtype), bottom_right_y - top_left_y)
         intersection_area = intersection_width * intersection_height
 
         boxes1_area = (boxes1_bottom_right[..., 0] - boxes1_top_left[..., 0]) * (boxes1_bottom_right[..., 1] - boxes1_top_left[..., 1])
@@ -31,14 +27,6 @@ class Processing:
         iou = intersection_area / api.maximum(union_area, 1e-6)  # Avoid division by zero
 
         return iou
-
-    def to_tensorflow(array):
-        array = from_dlpack(cp.ascontiguousarray(array).toDlpack())
-        return array
-
-    def to_cupy(array):
-        array = cp.from_dlpack(to_dlpack(array))
-        return array
 
 class ClipGradient:
     def __init__(self, clip_norm):
@@ -124,7 +112,5 @@ class AutoClipper:
 
         sorted_norms = tf.sort(self.norm_history[:self.iteration])
         clip_norm = tfp.stats.percentile(self.norm_history[: self.iteration], q=self.percentile)
-
-        print("[LOG] Clip Value:", clip_norm)
 
         return self._clip_gradient(gradient, clip_norm)

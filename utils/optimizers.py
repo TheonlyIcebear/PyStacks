@@ -1,4 +1,4 @@
-import tensorflow.compat.v1 as tf, numpy as np, cupy as cp
+import tensorflow.compat.v1 as tf
 
 
 class Adam:
@@ -22,14 +22,15 @@ class Adam:
         new_gradient_momentum = (self.momentum_constant * momentum) + (1 - self.momentum_constant) * gradient
         new_squared_momentum = (self.beta_constant * squared_momentum) + (1 - self.beta_constant) * (gradient ** 2)
 
-        _new_gradient_momentum = new_gradient_momentum / (1 - self.momentum_constant ** (iteration + 1))
-        _new_squared_momentum = new_squared_momentum / (1 - self.beta_constant ** (iteration + 1))
+        _new_gradient_momentum = new_gradient_momentum / tf.cast(1 - self.momentum_constant ** (iteration + 1), values.dtype)
+        _new_squared_momentum = new_squared_momentum / tf.cast(1 - self.beta_constant ** (iteration + 1), values.dtype)
 
         new_descent_values = [new_gradient_momentum, new_squared_momentum]
+        
+        learning_rate = tf.cast(learning_rate, values.dtype)
+        update = learning_rate * (_new_gradient_momentum / (tf.sqrt(_new_squared_momentum) + self.epsilon))
 
-        update = learning_rate * (_new_gradient_momentum / tf.sqrt(_new_squared_momentum + self.epsilon))
-        update += values * self.weight_decay * learning_rate
-
+        values.assign_sub(learning_rate * self.weight_decay * values)
         values.assign_sub(update)
 
         return new_descent_values
@@ -44,16 +45,18 @@ class RMSProp:
     def apply_gradient(self, values, gradient, descent_values, learning_rate, iteration):
         if descent_values is None:
             squared_momentum = tf.zeros_like(values)
-
+ 
         else:
             squared_momentum = descent_values
 
         new_squared_momentum = (self.beta_constant * squared_momentum) + (1 - self.beta_constant) * (gradient ** 2)
         new_descent_values = new_squared_momentum
 
+        learning_rate = tf.cast(learning_rate, values.dtype)
         update = learning_rate * (gradient / tf.sqrt(new_squared_momentum + self.epsilon))
-        update += values * self.weight_decay * learning_rate
-
+        
+        
+        values.assign_sub(learning_rate * self.weight_decay * values)
         values.assign_sub(update)
 
         return new_descent_values
@@ -71,10 +74,11 @@ class Momentum:
         else:
             momentum = descent_values
 
-        change = ( gradient ) + ( momentum * self.momentum_constant )
+        change = ( gradient * (1 - self.momentum_constant)) + ( momentum * self.momentum_constant )
 
         new_descent_values = change
 
+        learning_rate = tf.cast(learning_rate, values.dtype)
         update = change * learning_rate
         update += values * self.weight_decay * learning_rate
 
@@ -88,6 +92,7 @@ class SGD:
         self.cache_shape = tf.constant(0)
 
     def apply_gradient(self, values, gradient, descent_values, learning_rate, iteration):
+        learning_rate = tf.cast(learning_rate, values.dtype)
         update = values - (gradient * learning_rate)
         update += values * self.weight_decay * learning_rate
 
