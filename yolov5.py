@@ -48,7 +48,7 @@ class Generate:
         self.classes = classes
 
         self.iou_ignore_threshold = iou_ignore_threshold
-        self.local_buffer = deque()
+        self.local_buffer = deque(maxlen=self.batch_size * self.buffer_size)
 
         with open("annotations\\classes.txt", "r+") as file:
             self.class_names = file.read().splitlines()
@@ -57,7 +57,7 @@ class Generate:
 
         self.count = 0
 
-        self.workers = 1  # or 6–8 depending on CPU
+        self.workers = 2  # or 6–8 depending on CPU
 
         threading.Thread(target=self.prefetch_to_local, daemon=True).start()
 
@@ -83,22 +83,40 @@ class Generate:
 
     def prefetch_to_local(self): 
         while True: 
-            image, ydata = self.buffer.get()
-            self.local_buffer.append((image, ydata))
+            batch_xdata = []
+            batch_ydata = []
+            for _ in range(self.batch_size):
+                image, ydata = self.buffer.get()
+                batch_xdata.append(image)
+                batch_ydata.append(ydata)
+            self.local_buffer.append([batch_xdata, batch_ydata])
 
     def __call__(self):
-        while len(self.local_buffer)< self.batch_size:
+        start_time = time.perf_counter()
+        while len(self.local_buffer) == 0:
             time.sleep(0.001)
+        end_time = time.perf_counter()
+        print(f"[LOG] Buffer wait time: {end_time - start_time:.4f} seconds")
 
-        batch_images = []
-        batch_ydatas = []
+        start_time = time.perf_counter()
 
-        for _ in range(self.batch_size):
-            image, ydata = self.local_buffer.popleft()
-            batch_images.append(image)
-            batch_ydatas.append(ydata)
+        batch_xdata, batch_ydata = self.local_buffer.popleft()
 
-        return np.array(batch_images), batch_ydatas
+        end_time = time.perf_counter()
+        print(f"[LOG] Batch retrieval time: {end_time - start_time:.4f} seconds")
+
+        start_time = time.perf_counter()
+        batch_ydata = [
+            np.stack([y[i] for y in batch_ydata], axis=0)
+            for i in range(3)
+        ]
+        end_time = time.perf_counter()
+        print(f"[LOG] Batch stacking time: {end_time - start_time:.4f} seconds")
+
+        return (
+            np.array(batch_xdata, dtype=np.float32),
+            tuple(np.array(y, dtype=np.float32) for y in batch_ydata)
+        )
 
 def fill_buffer(
         buffer,
@@ -529,7 +547,7 @@ def live_plot(costs_np, x_values, yolo_head_count, titles, colors, grid_size):
 def conv(depth, kernel_shape, stride=1, padding="SAME"):
     return [
         Conv2d(depth=depth, kernel_shape=kernel_shape, stride=stride, padding=padding, batch_norm=BatchNorm(
-            momentum=0.99,
+            momentum=0.9,
             baked=True
         ), 
         activation_function=activation_function,
@@ -600,7 +618,7 @@ if __name__ == "__main__":
     batch_size = 32
     accumulate = 1
 
-    image_width, image_height = [416, 416]
+    image_width, image_height = [384, 384]
     yolo_head_count = 3
     
     grid_size = int(image_width / 32)
@@ -609,7 +627,7 @@ if __name__ == "__main__":
     anchors = 3
     classes = 3
 
-    yolo_size = 1 # 1: small, 2: medium, 3: large
+    yolo_size = 2 # 1: small, 2: medium, 3: large
 
     scale = 0.5 + (0.25) * (yolo_size - 1)
     depth_mult = yolo_size / 3
@@ -647,7 +665,7 @@ if __name__ == "__main__":
         ),
 
         RandomScaledCenterCrop(
-            min_scale=0.15, max_scale=0.5,
+            min_scale=0.15, max_scale=0.4,
         ),
     ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.1, label_fields=['class_labels']))
 
@@ -662,8 +680,8 @@ if __name__ == "__main__":
     concat_start3, residual_start3, concat_end3 = Concat(external_concat=optimize_concats).generate_layers()
     concat_start4, residual_start4, concat_end4 = Concat(external_concat=optimize_concats).generate_layers()
 
-    weight_initializer = YoloSplit(presence_initializer=HeNormal(), xy_initializer=HeNormal(), dimensions_initializer=LecunNormal(), class_initializer=HeNormal(), classes=classes, anchors=3)
-    bias_initializer = YoloSplit(presence_initializer=Fill(np.log(0.1)), xy_initializer=Fill(0), dimensions_initializer=Fill(0), class_initializer=Fill(0), classes=classes, anchors=3)
+    weight_initializer = YoloSplit(presence_initializer=LecunNormal(), xy_initializer=HeNormal(), dimensions_initializer=LecunNormal(), class_initializer=HeNormal(), classes=classes, anchors=3)
+    bias_initializer = YoloSplit(presence_initializer=Fill(-5), xy_initializer=Fill(0), dimensions_initializer=Fill(0), class_initializer=Fill(0), classes=classes, anchors=3)
 
     model = [
         Input((image_height, image_width, 3)),
@@ -715,28 +733,28 @@ if __name__ == "__main__":
         concat_end1,
 
         *csp_block(int(256 * scale), R(3), residual=False),
-        *conv(int(256 * scale), (1, 1), stride=1, padding="SAME"), # ROUTE 1
+        *conv(int(256 * scale), (1, 1), stride=1, padding="SAME"), # ROUTE 1 (23 layers)
          
-        *conv(int(256 * scale), (3, 3), stride=2, padding="SAME"), # 24 layers
+        *conv(int(256 * scale), (3, 3), stride=2, padding="SAME"), # 22 layers
 
-        residual_start3, # 23 layers
-        concat_end3, # 22 layers
+        residual_start3, # 21 layers
+        concat_end3, # 20 layers
 
-        *csp_block(int(256 * scale), R(3), residual=False), # 7 layers (21 layers)
-        *conv(int(512 * scale), (1, 1), stride=1, padding="SAME"), # ROUTE 2 (14 layers)
+        *csp_block(int(256 * scale), R(3), residual=False), # 19 layers (7 layers)
+        *conv(int(512 * scale), (1, 1), stride=1, padding="SAME"), # ROUTE 2 (12 layers)
 
-        *conv(int(512 * scale), (3, 3), stride=2, padding="SAME"), # 13 layers
+        *conv(int(512 * scale), (3, 3), stride=2, padding="SAME"), # 11 layers
 
-        residual_start4, # 12
-        concat_end4, # 11
+        residual_start4, # 10
+        concat_end4, # 9
 
-        *csp_block(int(512 * scale), 3, residual=False), # 7 layers (10 layers)
-        *conv(int(1024 * scale), (1, 1), stride=1, padding="SAME") # ROUTE 3 (3 layers)
+        *csp_block(int(512 * scale), 3, residual=False), # 8 layers (10 layers)
+        *conv(int(1024 * scale), (1, 1), stride=1, padding="SAME") # ROUTE 3 (1 layers)
     ]
 
     backprop_layer_indices = [
-        -25,
-        -14,
+        -23,
+        -12,
         -1,
     ]
 
@@ -784,15 +802,15 @@ if __name__ == "__main__":
         addon_layers=addon_layers,
         backprop_layer_indices=backprop_layer_indices,
         loss_function = [
-            YoloLoss(contraction_weight=1e-5, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight / 1, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
-            YoloLoss(contraction_weight=1e-5, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight / 4 , object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
-            YoloLoss(contraction_weight=1e-5, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight / 16, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(contraction_weight=3e-6, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(contraction_weight=3e-6, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight , object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(contraction_weight=3e-6, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
         ],
         # loss_function = YoloLoss(grid_size=grid_size, anchors=anchors, coordinate_weight=5, no_object_weight=no_object_weight, object_weight=1),
-        optimizer = Adam(momentum = 0.8, beta_constant = 0.9, weight_decay=1e-5), 
+        optimizer = Adam(momentum = 0.8,  beta_constant = 0.9, weight_decay=2e-5), 
         # optimizer = RMSProp(beta_constant = 0.9),
         # optimizer = Momentum(momentum=0.9),
-        scheduler = StepLR(initial_learning_rate=0.00025, decay_rate=0.5, decay_interval=80), 
+        scheduler = StepLR(initial_learning_rate=0.0001, decay_rate=0.6, decay_interval=50), 
         optimize_concats=optimize_concats,
         # scheduler=CosineAnnealingDecay(initial_learning_rate=0.001, min_learning_rate=0.00003, initial_cycle_size=15, cycle_mult=2),
         # scheduler=ExponentialDecay(initial_learning_rate=0.00007, decay_rate=0.995),
