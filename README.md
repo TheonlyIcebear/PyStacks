@@ -70,7 +70,6 @@ for cost in network.fit(generator=generator, batch_size=32, epochs=100):
 # Notes
 - This is **NOT** a replacement for actual neural network libraries like `TensorFlow` or `PyTorch` — I made this because I wanted to understand what's actually happening inside the black box
 - If you value your time, please don't use this on serious projects lol
-- Custom striding has a bug I haven't tracked down yet, I left it in anyway
 - BatchNorm intentionally stays in `float32` even when the rest of the network runs `float16`, for numerical stability
 
 # Sources 🔌
