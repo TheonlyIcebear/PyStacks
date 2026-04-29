@@ -158,7 +158,7 @@ if __name__ == "__main__":
 
     for idx, combined_costs in enumerate(zip(
                 network1.fit(generator=generator, batch_size = batch_size, epochs = 200, gradient_transformer=AutoClipper(10)), 
-                network1.fit(generator=generator, batch_size = batch_size, epochs = 200),
+                network2.fit(generator=generator, batch_size = batch_size, epochs = 200),
             )
         ):
         print(combined_costs)
