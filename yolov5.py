@@ -20,7 +20,11 @@ from typing import Annotated, Any, Literal, Union, cast
 import multiprocessing, threading, collections, numpy as np, pickle, time, json, cv2, os
 import time
 import random
+
 import tf2onnx
+import onnx
+from onnxsim import simplify
+
 
 class Generate:
     def __init__(self, batch_size, anchor_dimensions, dimensions, grid_size, anchors, classes, choices, buffer_size, iou_ignore_threshold = 0.8, data_augmentation=True):
@@ -406,13 +410,8 @@ def get_anchor_data(grid_size, bboxes):
 
     # Remove outliers
     
-    dimensions = dimensions[aspect_ratio < 6] 
-    dimensions = dimensions[dimensions[:, 0] < 0.3] 
-    dimensions = dimensions[dimensions[:, 1] < 0.8]
-    dimensions = dimensions[dimensions[:, 1] > 0.05]
-    dimensions = dimensions[dimensions[:, 0] * dimensions[:, 1] < 0.3] 
+    dimensions = dimensions[aspect_ratio < 6]
     dimensions = dimensions[dimensions[:, 0] * dimensions[:, 1] > 0.001]
-    
 
     # kmeans = KMeans(n_clusters=dimensions_count)
     # kmeans.fit(dimensions)
@@ -497,18 +496,6 @@ def save():
 
     with open(save_file, 'wb') as file:
         file.write(pickle.dumps(save_data))
-
-    
-    spec = tf.TensorSpec([1, image_height, image_width, 3], tf.float16)
-
-    graphed_forward = tf.function(lambda x: network.forward(x, training=False), input_signature=[spec])
-
-    onnx_model, _ = tf2onnx.convert.from_function(
-        graphed_forward,
-        input_signature=[spec],
-        opset=17,
-        output_path="model-training-data.onnx"
-    )
 
     with open("cost-overtime.json", "w+") as file:
         file.write(json.dumps(costs.tolist()))
@@ -615,10 +602,10 @@ def sppf():
 
 if __name__ == "__main__":
     training_percent = 0.975
-    batch_size = 32
+    batch_size = 24
     accumulate = 1
 
-    image_width, image_height = [384, 384]
+    image_width, image_height = [416, 416]
     yolo_head_count = 3
     
     grid_size = int(image_width / 32)
@@ -636,7 +623,7 @@ if __name__ == "__main__":
         return max(1, np.int32(np.ceil(x * depth_mult)))
 
     dropout_rate = 0
-    activation_function = Mish()
+    activation_function = LRelu()
     optimize_concats = True
     variance = "He"
     dtype = np.float16
@@ -654,19 +641,28 @@ if __name__ == "__main__":
         A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.75),
         A.RandomBrightnessContrast(
             brightness_limit=[-0.07, 0.07],
-            contrast_limit=[-0.07, 0.07],
+            contrast_limit=[0, 0.07],
             p=0.5
         ),
         A.HueSaturationValue(
-            hue_shift_limit=5,
-            sat_shift_limit=5,
-            val_shift_limit=5,
+            hue_shift_limit=3,
+            sat_shift_limit=3,
+            val_shift_limit=3,
             p=0.5
         ),
 
         RandomScaledCenterCrop(
-            min_scale=0.15, max_scale=0.4,
+            min_scale=0.1, max_scale=0.45,
         ),
+
+        A.Perspective(
+            scale=(0.05, 0.08),
+            keep_size=True,
+            pad_mode=cv2.BORDER_CONSTANT,
+            pad_val=0,
+            p=0.65
+        ),
+
     ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.1, label_fields=['class_labels']))
 
     bboxes = get_bboxes(choices)
@@ -681,7 +677,7 @@ if __name__ == "__main__":
     concat_start4, residual_start4, concat_end4 = Concat(external_concat=optimize_concats).generate_layers()
 
     weight_initializer = YoloSplit(presence_initializer=LecunNormal(), xy_initializer=HeNormal(), dimensions_initializer=LecunNormal(), class_initializer=HeNormal(), classes=classes, anchors=3)
-    bias_initializer = YoloSplit(presence_initializer=Fill(-5), xy_initializer=Fill(0), dimensions_initializer=Fill(0), class_initializer=Fill(0), classes=classes, anchors=3)
+    bias_initializer = YoloSplit(presence_initializer=Fill(0), xy_initializer=Fill(0), dimensions_initializer=Fill(0), class_initializer=Fill(0), classes=classes, anchors=3)
 
     model = [
         Input((image_height, image_width, 3)),
@@ -748,7 +744,7 @@ if __name__ == "__main__":
         residual_start4, # 10
         concat_end4, # 9
 
-        *csp_block(int(512 * scale), 3, residual=False), # 8 layers (10 layers)
+        *csp_block(int(512 * scale), R(3), residual=False), # 8 layers (7 layers)
         *conv(int(1024 * scale), (1, 1), stride=1, padding="SAME") # ROUTE 3 (1 layers)
     ]
 
@@ -776,8 +772,8 @@ if __name__ == "__main__":
         ],
     ]
 
-    cooridnate_weight = 5
-    no_object_weight = 5
+    cooridnate_weight = 2
+    no_object_weight = 0.01
     object_weight = 1
     
     # Fundamental theory:
@@ -787,6 +783,7 @@ if __name__ == "__main__":
     # Then object_loss can gradually take over as coordinate_loss converges
     # Contraction loss also starts to conflict with coordinate_loss when it's too high
     # So we keep it low to allow coordinate_loss to converge first
+    # Also since object_loss decreases so quickly in the beginning it accumulates a lot of momentum so to combat this we use a smaller momentum term for adam
     
     inv_freqs = 1.0 / (class_occurences / min(class_occurences))
     alpha = inv_freqs / inv_freqs.sum()
@@ -802,15 +799,15 @@ if __name__ == "__main__":
         addon_layers=addon_layers,
         backprop_layer_indices=backprop_layer_indices,
         loss_function = [
-            YoloLoss(contraction_weight=3e-6, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
-            YoloLoss(contraction_weight=3e-6, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight , object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
-            YoloLoss(contraction_weight=3e-6, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(contraction_weight=0, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(contraction_weight=0, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight, anchor_dimensions=anchor_dimensions, dtype=dtype),
+            YoloLoss(contraction_weight=0, coordinate_loss_function=DIoU, objectness_loss_function=BCE, class_loss_function=FL, grid_size=grid_size, anchors=anchors, classes=classes, coordinate_weight=cooridnate_weight, no_object_weight=no_object_weight, object_weight=object_weight * 1.5, anchor_dimensions=anchor_dimensions, dtype=dtype),
         ],
         # loss_function = YoloLoss(grid_size=grid_size, anchors=anchors, coordinate_weight=5, no_object_weight=no_object_weight, object_weight=1),
-        optimizer = Adam(momentum = 0.8,  beta_constant = 0.9, weight_decay=2e-5), 
+        optimizer = Adam(momentum = 0.95,  beta_constant = 0.95, weight_decay = 5e-4), 
         # optimizer = RMSProp(beta_constant = 0.9),
         # optimizer = Momentum(momentum=0.9),
-        scheduler = StepLR(initial_learning_rate=0.0001, decay_rate=0.6, decay_interval=50), 
+        scheduler = StepLR(initial_learning_rate=0.00015, decay_rate=0.5, decay_interval=90), 
         optimize_concats=optimize_concats,
         # scheduler=CosineAnnealingDecay(initial_learning_rate=0.001, min_learning_rate=0.00003, initial_cycle_size=15, cycle_mult=2),
         # scheduler=ExponentialDecay(initial_learning_rate=0.00007, decay_rate=0.995),
@@ -853,7 +850,7 @@ if __name__ == "__main__":
         json.dump(config, json_file)
 
 
-    for idx, cost in enumerate(network.fit(generator=generator, batch_size=batch_size, accumulate=accumulate, epochs = 2000000000, gradient_transformer=AutoClipper(5))):
+    for idx, cost in enumerate(network.fit(generator=generator, batch_size=batch_size, accumulate=accumulate, epochs = 2000000000, gradient_transformer=AutoClipper(5)), start=starting_idx):
 
         print(cost)
 
@@ -879,7 +876,7 @@ if __name__ == "__main__":
                 plt.pause(0.001)
                 print("POST DRAW")
 
-            if not idx % 30 and not np.isnan(cost).any():
+            if not idx % 150 and not np.isnan(cost).any():
                 save()
 
                 print("PASSED SAVE")
