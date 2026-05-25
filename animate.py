@@ -64,20 +64,19 @@ class RandomScaledCenterCrop(A.CenterCrop):
         return super().get_params_dependent_on_data(params, data)
 
 class Animate:
-    def __init__(self, min_presence_score=0.87, max_iou=0.5):
+    def __init__(self, min_presence_score=0.8, max_iou=0.3):
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.intra_op_num_threads = 4
 
         session = ort.InferenceSession(
             "model-training-data.onnx",
             sess_options=so,
-            providers=["DmlExecutionProvider", "CPUExecutionProvider"]
+            providers=["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]
         )
 
-        so.intra_op_num_threads = 4
-
         self.input_name = session.get_inputs()[0].name
-        dummy = np.random.randn(1, 352, 352, 3).astype(np.float16)
+        dummy = np.random.randn(1, 416, 416, 3).astype(np.float16)
 
         for _ in range(50):
             session.run(None, {
@@ -290,30 +289,41 @@ class Animate:
             A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.75),
             A.RandomBrightnessContrast(
                 brightness_limit=[-0.07, 0.07],
-                contrast_limit=[-0.07, 0.07],
+                contrast_limit=[0, 0.07],
                 p=0.5
             ),
             A.HueSaturationValue(
-                hue_shift_limit=5,
-                sat_shift_limit=5,
-                val_shift_limit=5,
+                hue_shift_limit=3,
+                sat_shift_limit=3,
+                val_shift_limit=3,
                 p=0.5
             ),
 
             RandomScaledCenterCrop(
                 min_scale=0.1, max_scale=0.45,
             ),
-        ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.1, label_fields=['class_labels']))
 
+            A.Perspective(
+                scale=(0.05, 0.08),
+                keep_size=True,
+                pad_mode=cv2.BORDER_CONSTANT,
+                pad_val=0,
+                p=0.65
+            ),
+
+        ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.1, label_fields=['class_labels']))
         augmented_result = augmentor(image=np.array(pil_image), bboxes=location_data[..., 1:], class_labels=classes)
 
         location_data = np.array(augmented_result['bboxes'])
         image = Image.fromarray(augmented_result['image']).resize((self.image_width, self.image_height))
 
         input_data = np.asarray(image).astype(self.dtype) / 255
+        time1 = time.perf_counter()
         outputs = self.session.run(None, {
                 self.input_name: input_data[None, ...],
             })
+        time2 = time.perf_counter()
+        print(f"Inference Time: {1/(time2 - time1):.4f} FPS")
         confidence_scores, box_data, classes = self.parse_output(outputs)
 
         confidence_scores = confidence_scores.numpy()
