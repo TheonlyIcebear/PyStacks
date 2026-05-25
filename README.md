@@ -13,6 +13,12 @@ I've been working on neural network projects for the past year, with my earliest
 YOLO-v5 Object Detection training loss:<br>
 <img width="1599" height="667" alt="image" src="https://github.com/user-attachments/assets/2858dd63-9c60-4295-a189-b2be1face738" />
 
+## Development 🔨
+- While attempting to train this model I noticed many issues such as noisy datasets, overfitting etc and unexpected convergence. 
+- To overcome these challenges I had to implement techniques such as data augmentation and smaller model sizes.
+- The hardest challenge I faced was with my yolov5 model. My object-loss was increasing instead of decreasing. This was due to the fact that objectness is trying to predict the quality of the boxes. In early training it quickly learned to predict low scores since the model was poor. But as the model improved the momentum from the early training was overpowering the new signal and caused the model to continuing predicint low scores despite the model improving.
+  - To combat this I had to reduce my Adam hyperparameters to 0.95 to reduce the memory to only around 20 batches.
+
 ## ✨ Features
 - **Fully Modular Layer System:**
   Build models by composing layers exactly like Keras or PyTorch, but every forward pass, backward pass, and weight update is written manually — no autograd shortcuts
