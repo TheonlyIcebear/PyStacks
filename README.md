@@ -11,7 +11,8 @@ I've been working on neural network projects for the past year, with my earliest
 - So I did a complete rewrite making everything modular, similar to Keras' `Sequential` class, which let me quickly build up features like `Batch Normalization`, `CSP blocks`, and multi-scale detection heads without rewriting everything each time
 
 YOLO-v5 Object Detection training loss:<br>
-<img width="1599" height="667" alt="image" src="https://github.com/user-attachments/assets/2858dd63-9c60-4295-a189-b2be1face738" />
+<img width="1598" height="664" alt="image" src="https://github.com/user-attachments/assets/134feffa-6e68-4005-99b8-364fe7c5c740" />
+
 
 ## Development 🔨
 - While attempting to train this model I noticed many issues such as noisy datasets, overfitting etc and unexpected convergence. 
