@@ -32,6 +32,15 @@ class Uniform:
     def __call__(self, fan_in, fan_out, shape):
         return tf.random.uniform(shape, self.start, self.stop)
 
+class ScaledUniform:
+    def __init__(self, gain=1.0):
+        self.gain = gain
+
+    def __call__(self, fan_in, fan_out, shape):
+        variance = tf.sqrt(self.gain / (fan_in))
+        return tf.random.uniform(shape, -variance, variance)
+
+
 class Normal:
     def __init__(self, mean=0, std=1):
         self.mean = mean
@@ -39,6 +48,14 @@ class Normal:
 
     def __call__(self, fan_in, fan_out, shape):
         return tf.random.normal(shape, self.mean, self.std)
+
+class ScaledNormal:
+    def __init__(self, gain=1.0, mean=0, std=1):
+        self.gain = gain
+
+    def __call__(self, fan_in, fan_out, shape):
+        variance = tf.sqrt(self.gain / (fan_in))
+        return tf.random.normal(shape, 0, variance)
 
 class Fill:
     def __init__(self, value=0):
