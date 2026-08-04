@@ -877,9 +877,11 @@ def live_plot(costs_np, x_values, yolo_head_count, titles, colors, grid_size,
 
             if val_costs_np is not None and len(val_costs_np) > 3:
                 val_line.set_data(val_x_values[2:], val_costs_np[2:, i, j])
-                val_line.set_color(colors[j])
             else:
                 val_line.set_data(val_x_values, val_costs_np[:, i, j]) if val_costs_np is not None else None
+
+            val_line.set_color(colors[j])
+
             ax.relim()
             ax.autoscale_view()
 
@@ -959,10 +961,10 @@ def sppf():
 
 if __name__ == "__main__":
     training_percent = 0.975
-    batch_size = 24
+    batch_size = 16
     accumulate = 1
 
-    image_width, image_height = [416, 416]
+    image_width, image_height = [352, 352]
     yolo_head_count = 3
 
     head_only = False
@@ -1043,8 +1045,7 @@ if __name__ == "__main__":
         A.OneOf([
             A.RandomShadow(p=1.0),
             A.GaussNoise(var_limit=(5.0, 15.0), p=1.0),
-            A.MotionBlur(blur_limit=5, p=1.0),
-            A.ISONoise(p=1.0),
+            A.MotionBlur(blur_limit=3, p=1.0)
         ], p=0.15),
 
         RandomScaledCenterCrop(
@@ -1068,7 +1069,7 @@ if __name__ == "__main__":
     concat_start4, residual_start4, concat_end4 = Concat(external_concat=optimize_concats).generate_layers()
 
     weight_initializer = YoloSplit(presence_initializer=HeNormal(), xy_initializer=HeNormal(), dimensions_initializer=ScaledNormal(gain=3.0), class_initializer=HeNormal(), classes=classes, anchors=anchors)
-    bias_initializer = YoloSplit(presence_initializer=Fill(-2.5), xy_initializer=Fill(0), dimensions_initializer=Fill(1.5), class_initializer=Fill(0), classes=classes, anchors=anchors)
+    bias_initializer = YoloSplit(presence_initializer=Fill(-1), xy_initializer=Fill(0), dimensions_initializer=Fill(1.5), class_initializer=Fill(0), classes=classes, anchors=anchors)
 
     model = [
         Resize((image_height, image_width)),
@@ -1165,7 +1166,7 @@ if __name__ == "__main__":
 
     cooridnate_weight = 5
     no_object_weight = 10
-    object_weight = 0.5
+    object_weight = 1.0
     cls_weight = 0.5
 
     # Fundamental theory:
@@ -1188,7 +1189,7 @@ if __name__ == "__main__":
     alpha /= alpha.sum()
 
     print("Weights:", alpha)
-    class_loss_function = FocalBCE(alpha=alpha, gamma=2.0)
+    class_loss_function = FocalLoss(alpha=alpha, gamma=2.0)
 
     print("Objects Per Scale:", objects_per_scale)
 
